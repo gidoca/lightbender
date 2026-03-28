@@ -686,7 +686,7 @@ impl Renderer {
     }
 
     /// Return a LoadContext for the glTF loader to use.
-    pub fn load_context(&self) -> LoadContext {
+    pub fn load_context(&self) -> LoadContext<'_> {
         LoadContext {
             device:              &self.device,
             instance:            &self.instance,

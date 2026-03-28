@@ -33,6 +33,7 @@ impl Default for Transform {
 
 // ── Scene nodes ──────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct SceneNode {
     pub name:            String,
     pub local_transform: Transform,
@@ -56,6 +57,7 @@ impl GpuTexture {
     }
 }
 
+#[allow(dead_code)]
 pub struct GpuMaterial {
     pub base_color_factor:          [f32; 4],
     pub metallic_factor:            f32,
@@ -87,6 +89,7 @@ impl GpuPrimitive {
     }
 }
 
+#[allow(dead_code)]
 pub struct GpuMesh {
     pub name:       String,
     pub primitives: Vec<GpuPrimitive>,

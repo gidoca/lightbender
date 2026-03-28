@@ -11,6 +11,7 @@ use crate::renderer::Renderer;
 // ── JSON schema ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct SceneDescription {
     pub camera:      CameraDesc,
     #[serde(default)]
@@ -56,6 +57,7 @@ fn default_far()      -> f32 { 1000.0 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum LightDesc {
     Directional {
         #[serde(default)]
@@ -122,6 +124,7 @@ impl Default for TransformDesc {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct ModelDesc {
     #[serde(default)]
     pub name:      String,
@@ -133,6 +136,7 @@ pub struct ModelDesc {
 }
 
 #[derive(Deserialize, Default)]
+#[allow(dead_code)]
 pub struct EnvironmentDesc {
     #[serde(default)]
     pub ambient_color:     [f32; 3],
@@ -165,7 +169,6 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
     let mut node_offset = 0usize;
     let mut mesh_offset  = 0usize;
     let mut mat_offset   = 0usize;
-    let mut tex_offset   = 0usize;
 
     for model_desc in &desc.models {
         let model_path = resolve_path(base, &model_desc.path);
@@ -206,7 +209,6 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
             node_offset += sub.nodes.len();
             mesh_offset += sub.meshes.len();
             mat_offset  += sub.materials.len();
-            tex_offset  += sub.textures.len();
 
             base_scene.nodes.extend(sub.nodes);
             base_scene.meshes.extend(sub.meshes);
@@ -225,7 +227,6 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
             node_offset = sub.nodes.len();
             mesh_offset = sub.meshes.len();
             mat_offset  = sub.materials.len();
-            tex_offset  = sub.textures.len();
             merged = Some(sub);
         }
     }
