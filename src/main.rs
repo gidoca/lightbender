@@ -3,6 +3,7 @@ mod camera;
 mod input;
 mod renderer;
 mod scene;
+mod shader;
 mod types;
 mod vulkan;
 

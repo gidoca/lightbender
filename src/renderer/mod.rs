@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -7,6 +8,7 @@ use winit::window::Window;
 
 use crate::camera::Camera;
 use crate::scene::{gltf_loader::LoadContext, Scene};
+use crate::shader::ShaderPair;
 use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 
@@ -49,7 +51,8 @@ pub struct Renderer {
     /// Set 1: per-material textures (5× combined image samplers)
     pub material_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
+    /// "default" pipeline + any user-loaded named pipelines
+    pipelines: HashMap<String, vk::Pipeline>,
 
     framebuffers: Vec<vk::Framebuffer>,
 
@@ -242,9 +245,11 @@ impl Renderer {
         let material_set_layout = create_material_set_layout(&device)?;
 
         // --- Pipeline ---
-        let (pipeline_layout, pipeline) =
-            create_pipeline(&device, render_pass, swapchain_extent, descriptor_set_layout, material_set_layout)
+        let (pipeline_layout, default_pipeline) =
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, None)
                 .context("pipeline")?;
+        let mut pipelines = HashMap::new();
+        pipelines.insert("default".to_string(), default_pipeline);
 
         // --- Framebuffers ---
         let framebuffers = create_framebuffers(
@@ -394,7 +399,7 @@ impl Renderer {
             descriptor_set_layout,
             material_set_layout,
             pipeline_layout,
-            pipeline,
+            pipelines,
             framebuffers,
             command_pool,
             command_buffers,
@@ -540,8 +545,8 @@ impl Renderer {
         self.device
             .cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
 
-        self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+        let default_pipeline = *self.pipelines.get("default").expect("default pipeline missing");
+        let mut bound_pipeline = vk::Pipeline::null();
 
         let viewport = vk::Viewport {
             x: 0.0,
@@ -572,6 +577,15 @@ impl Renderer {
             for (world, prim) in scene.draw_primitives() {
                 let mat = &scene.materials[prim.material];
 
+                // Switch pipeline if this material requests a different one
+                let pipeline = mat.pipeline_name.as_deref()
+                    .and_then(|n| self.pipelines.get(n).copied())
+                    .unwrap_or(default_pipeline);
+                if pipeline != bound_pipeline {
+                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    bound_pipeline = pipeline;
+                }
+
                 // Bind material descriptor set (set 1)
                 self.device.cmd_bind_descriptor_sets(
                     cmd,
@@ -597,7 +611,8 @@ impl Renderer {
                 self.device.cmd_draw_indexed(cmd, prim.index_count, 1, 0, 0, 0);
             }
         } else {
-            // Fallback: draw the hardcoded cube
+            // Fallback: draw the hardcoded cube with the default pipeline
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, default_pipeline);
             let model_arr = Mat4::IDENTITY.to_cols_array_2d();
             let model_bytes = bytemuck::bytes_of(&model_arr);
             self.device.cmd_push_constants(
@@ -615,6 +630,23 @@ impl Renderer {
         self.device.cmd_end_render_pass(cmd);
         self.device.end_command_buffer(cmd)?;
         Ok(())
+    }
+
+    /// Build and register a named pipeline from an already-loaded shader pair.
+    pub fn add_pipeline(&mut self, name: &str, pair: &ShaderPair) -> Result<()> {
+        unsafe {
+            let (_, pipeline) = create_pipeline(
+                &self.device,
+                self.render_pass,
+                self.descriptor_set_layout,
+                self.material_set_layout,
+                Some(pair),
+            )?;
+            if let Some(old) = self.pipelines.insert(name.to_string(), pipeline) {
+                self.device.destroy_pipeline(old, None);
+            }
+            Ok(())
+        }
     }
 
     pub fn device(&self) -> &ash::Device {
@@ -735,7 +767,9 @@ impl Drop for Renderer {
                 self.device.destroy_image_view(*iv, None);
             }
 
-            self.device.destroy_pipeline(self.pipeline, None);
+            for pipeline in self.pipelines.values() {
+                self.device.destroy_pipeline(*pipeline, None);
+            }
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
 
@@ -1130,21 +1164,27 @@ unsafe fn create_material_set_layout(device: &ash::Device) -> Result<vk::Descrip
 unsafe fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    _extent: vk::Extent2D,
     descriptor_set_layout: vk::DescriptorSetLayout,
     material_set_layout: vk::DescriptorSetLayout,
+    // Pre-loaded shader modules to use. If None, loads the built-in mesh shaders.
+    shader_pair: Option<&ShaderPair>,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
-    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.vert.spv"))
-        .context("load vertex shader")?;
-    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.frag.spv"))
-        .context("load fragment shader")?;
-
-    let vert_module = device
-        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
-        .context("vert shader module")?;
-    let frag_module = device
-        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)
-        .context("frag shader module")?;
+    // Either use provided modules or load the built-in mesh shaders
+    let (vert_module, frag_module, owned) = if let Some(pair) = shader_pair {
+        (pair.vert, pair.frag, false)
+    } else {
+        let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.vert.spv"))
+            .context("load vertex shader")?;
+        let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.frag.spv"))
+            .context("load fragment shader")?;
+        let v = device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
+            .context("vert shader module")?;
+        let f = device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)
+            .context("frag shader module")?;
+        (v, f, true)
+    };
 
     let entry_point = c"main";
     let stages = [
@@ -1249,8 +1289,11 @@ unsafe fn create_pipeline(
         .map_err(|(_, e)| e)
         .context("graphics pipeline")?;
 
-    device.destroy_shader_module(vert_module, None);
-    device.destroy_shader_module(frag_module, None);
+    // Only destroy modules we created ourselves (not caller-owned ones)
+    if owned {
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+    }
 
     Ok((layout, pipelines[0]))
 }

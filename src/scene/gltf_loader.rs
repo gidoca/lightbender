@@ -112,28 +112,32 @@ unsafe fn load_inner(
         textures.push(GpuTexture { image: gpu_image, sampler });
     }
 
-    // ── 1×1 white placeholder (for absent textures) ───────────────────────────
-    let white_image = GpuImage::upload_rgba8(
-        ctx.device,
-        ctx.instance,
-        ctx.physical_device,
-        ctx.command_pool,
-        ctx.queue,
-        1,
-        1,
-        &[255, 255, 255, 255],
-    )?;
-    let white_sampler = ctx.device.create_sampler(
-        &vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT),
-        None,
-    )?;
-    let white_tex = GpuTexture { image: white_image, sampler: white_sampler };
+    // ── 1×1 placeholder textures ──────────────────────────────────────────────
+    let make_placeholder = |pixels: [u8; 4]| -> Result<GpuTexture> {
+        let img = GpuImage::upload_rgba8(
+            ctx.device, ctx.instance, ctx.physical_device,
+            ctx.command_pool, ctx.queue, 1, 1, &pixels,
+        )?;
+        let sampler = ctx.device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT),
+            None,
+        )?;
+        Ok(GpuTexture { image: img, sampler })
+    };
+    // White = base color (albedo=1), occlusion (fully lit)
+    let white_tex = make_placeholder([255, 255, 255, 255])?;
+    // Flat-normal placeholder: (0.5, 0.5, 1.0) ≈ tangent-space up
+    let flat_normal_tex = make_placeholder([128, 128, 255, 255])?;
+    // Metallic-roughness: G=roughness=0.5, B=metallic=0 (non-metallic, medium rough)
+    let mr_placeholder = make_placeholder([0, 128, 0, 255])?;
+    // Black = no emission
+    let black_tex = make_placeholder([0, 0, 0, 255])?;
 
     // ── Descriptor pool for material sets ────────────────────────────────────
     let mat_count = document.materials().count().max(1) as u32;
@@ -179,17 +183,17 @@ unsafe fn load_inner(
 
         let ds = alloc_set(descriptor_pool)?;
 
-        // Gather the five texture slots (view + sampler), falling back to white
-        let slot = |idx: Option<usize>| -> (vk::ImageView, vk::Sampler) {
+        // Gather the five texture slots (view + sampler), using appropriate fallbacks
+        let tex_or = |idx: Option<usize>, fallback: &GpuTexture| -> (vk::ImageView, vk::Sampler) {
             idx.map(|i| (textures[i].image.view, textures[i].sampler))
-               .unwrap_or((white_tex.image.view, white_tex.sampler))
+               .unwrap_or((fallback.image.view, fallback.sampler))
         };
 
-        let (bc_view, bc_samp) = slot(pbr.base_color_texture().map(|t| t.texture().index()));
-        let (nm_view, nm_samp) = slot(material.normal_texture().map(|t| t.texture().index()));
-        let (mr_view, mr_samp) = slot(pbr.metallic_roughness_texture().map(|t| t.texture().index()));
-        let (oc_view, oc_samp) = slot(material.occlusion_texture().map(|t| t.texture().index()));
-        let (em_view, em_samp) = slot(material.emissive_texture().map(|t| t.texture().index()));
+        let (bc_view, bc_samp) = tex_or(pbr.base_color_texture().map(|t| t.texture().index()), &white_tex);
+        let (nm_view, nm_samp) = tex_or(material.normal_texture().map(|t| t.texture().index()), &flat_normal_tex);
+        let (mr_view, mr_samp) = tex_or(pbr.metallic_roughness_texture().map(|t| t.texture().index()), &mr_placeholder);
+        let (oc_view, oc_samp) = tex_or(material.occlusion_texture().map(|t| t.texture().index()), &white_tex);
+        let (em_view, em_samp) = tex_or(material.emissive_texture().map(|t| t.texture().index()), &black_tex);
 
         let image_infos = [
             vk::DescriptorImageInfo { image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, image_view: bc_view, sampler: bc_samp },
@@ -223,12 +227,16 @@ unsafe fn load_inner(
             occlusion_texture:          material.occlusion_texture().map(|t| t.texture().index()),
             emissive_texture:           material.emissive_texture().map(|t| t.texture().index()),
             double_sided:               material.double_sided(),
+            pipeline_name:              None,
             descriptor_set:             ds,
         });
     }
 
-    // Add white_tex to texture list so it gets cleaned up
+    // Add placeholder textures to list so they get cleaned up
     textures.push(white_tex);
+    textures.push(flat_normal_tex);
+    textures.push(mr_placeholder);
+    textures.push(black_tex);
 
     // ── Meshes ────────────────────────────────────────────────────────────────
     // Default material index — fallback if a primitive has no material
@@ -256,6 +264,7 @@ unsafe fn load_inner(
             occlusion_texture: None,
             emissive_texture: None,
             double_sided: false,
+            pipeline_name: None,
             descriptor_set: ds,
         });
         0

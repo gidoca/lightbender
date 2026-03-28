@@ -67,6 +67,8 @@ pub struct GpuMaterial {
     pub occlusion_texture:          Option<usize>,
     pub emissive_texture:           Option<usize>,
     pub double_sided:               bool,
+    /// Named pipeline to use when rendering this material (None = "default").
+    pub pipeline_name:              Option<String>,
     /// Descriptor set (set 1) for this material's textures.
     pub descriptor_set:             vk::DescriptorSet,
 }

@@ -14,6 +14,7 @@ use crate::camera::OrbitalCamera;
 use crate::input::InputState;
 use crate::renderer::Renderer;
 use crate::scene::{gltf_loader, loader, Scene};
+use crate::shader::ShaderLibrary;
 
 pub enum InputPath {
     Model(PathBuf),
@@ -58,7 +59,7 @@ impl App {
                     .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 720u32)),
             )?,
         );
-        let renderer = Renderer::new(window.clone())?;
+        let mut renderer = Renderer::new(window.clone())?;
 
         let mut camera = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
 
@@ -84,6 +85,36 @@ impl App {
                         camera.camera.fov_y = f32::to_radians(cd.fov_y);
                         camera.camera.near  = cd.near;
                         camera.camera.far   = cd.far;
+
+                        // Load named shader pipelines from scene description
+                        let base = path.parent().unwrap_or(std::path::Path::new("."));
+                        let mut lib = ShaderLibrary::new();
+                        for (name, sd) in &loaded.description.shaders {
+                            let vert_path = if std::path::Path::new(&sd.vert).is_absolute() {
+                                std::path::PathBuf::from(&sd.vert)
+                            } else {
+                                base.join(&sd.vert)
+                            };
+                            let frag_path = if std::path::Path::new(&sd.frag).is_absolute() {
+                                std::path::PathBuf::from(&sd.frag)
+                            } else {
+                                base.join(&sd.frag)
+                            };
+                            match unsafe { lib.load(renderer.device(), name, &vert_path, &frag_path) } {
+                                Ok(()) => {
+                                    let pair = lib.pairs.get(name).unwrap();
+                                    if let Err(e) = renderer.add_pipeline(name, pair) {
+                                        log::error!("Failed to build pipeline '{name}': {e:#}");
+                                    } else {
+                                        log::info!("Registered shader pipeline: {name}");
+                                    }
+                                }
+                                Err(e) => log::error!("Failed to load shader '{name}': {e:#}"),
+                            }
+                        }
+                        // Shader modules can be destroyed after pipeline creation
+                        unsafe { lib.destroy(renderer.device()); }
+
                         log::info!("Loaded scene: {}", path.display());
                         Some(loaded.scene)
                     }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -14,10 +15,19 @@ pub struct SceneDescription {
     pub camera:      CameraDesc,
     #[serde(default)]
     pub lights:      Vec<LightDesc>,
+    /// Named shader pairs: "name" -> { vert, frag } SPIR-V paths.
+    #[serde(default)]
+    pub shaders:     HashMap<String, ShaderDesc>,
     #[serde(default)]
     pub models:      Vec<ModelDesc>,
     #[serde(default)]
     pub environment: EnvironmentDesc,
+}
+
+#[derive(Deserialize)]
+pub struct ShaderDesc {
+    pub vert: String,
+    pub frag: String,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +128,8 @@ pub struct ModelDesc {
     pub path:      String,
     #[serde(default)]
     pub transform: TransformDesc,
+    /// Named shader to use for this model's primitives (must be in `shaders`).
+    pub shader:    Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -159,6 +171,13 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
         let model_path = resolve_path(base, &model_desc.path);
         let mut sub = gltf_loader::load(&ctx, &model_path)
             .with_context(|| format!("load model: {}", model_path.display()))?;
+
+        // Apply the model's shader to all its materials
+        if let Some(shader_name) = &model_desc.shader {
+            for mat in &mut sub.materials {
+                mat.pipeline_name = Some(shader_name.clone());
+            }
+        }
 
         // Apply the scene-level transform to all root nodes of this sub-scene
         let tf = Transform {

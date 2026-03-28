@@ -1,17 +1,17 @@
 {
   "camera": {
     "target":   [0.0, 0.0, 0.0],
-    "distance": 0.3,
+    "distance": 2.5,
     "yaw":      30.0,
-    "pitch":    20.0,
-    "fov_y":    60.0,
-    "near":     0.001,
-    "far":      1000.0
+    "pitch":    15.0,
+    "fov_y":    45.0,
+    "near":     0.01,
+    "far":      100.0
   },
   "lights": [
     {
       "type":      "directional",
-      "name":      "sun",
+      "name":      "key",
       "direction": [-0.5, -1.0, -0.5],
       "color":     [1.0, 0.95, 0.85],
       "intensity": 3.0
@@ -25,8 +25,8 @@
   },
   "models": [
     {
-      "name":    "avocado",
-      "path":    "../../glTF-Sample-Models/2.0/Avocado/glTF-Binary/Avocado.glb",
+      "name":    "helmet",
+      "path":    "../../glTF-Sample-Models/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
       "shader":  "pbr",
       "transform": {
         "translation": [0.0, 0.0, 0.0],
@@ -36,8 +36,8 @@
     }
   ],
   "environment": {
-    "ambient_color":     [0.05, 0.05, 0.1],
+    "ambient_color":     [0.05, 0.07, 0.1],
     "ambient_intensity": 0.3,
-    "background_color":  [0.12, 0.12, 0.15]
+    "background_color":  [0.08, 0.08, 0.1]
   }
 }
