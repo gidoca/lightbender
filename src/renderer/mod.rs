@@ -16,6 +16,25 @@ use crate::vulkan::image::GpuImage;
 const FRAMES_IN_FLIGHT: usize = 2;
 const PIPELINE_CACHE_FILE: &str = "pipeline_cache.bin";
 
+enum RenderTarget {
+    Window {
+        window: Arc<Window>,
+        surface_loader: ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        swapchain_loader: ash::khr::swapchain::Device,
+        swapchain: vk::SwapchainKHR,
+        present_queue: vk::Queue,
+        present_family: u32,
+        image_available: Vec<vk::Semaphore>,
+        render_finished: Vec<vk::Semaphore>,
+        next_semaphore: usize,
+    },
+    Offscreen {
+        color_image: vk::Image,
+        color_image_memory: vk::DeviceMemory,
+    },
+}
+
 pub struct Renderer {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -26,18 +45,13 @@ pub struct Renderer {
     #[cfg(debug_assertions)]
     enable_validation: bool,
 
-    surface_loader: ash::khr::surface::Instance,
-    surface: vk::SurfaceKHR,
-
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     graphics_queue: vk::Queue,
-    present_queue: vk::Queue,
     graphics_family: u32,
-    present_family: u32,
 
-    swapchain_loader: ash::khr::swapchain::Device,
-    swapchain: vk::SwapchainKHR,
+    render_target: RenderTarget,
+
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain_format: vk::Format,
@@ -82,25 +96,21 @@ pub struct Renderer {
     index_buffer: GpuBuffer,
     index_count: u32,
 
-    /// One per swapchain image — cycled through for acquire
-    image_available: Vec<vk::Semaphore>,
-    /// One per swapchain image — indexed by acquired image index
-    render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
     current_frame: usize,
-    /// Tracks which image_available semaphore to pass to acquire_next_image
-    next_semaphore: usize,
     last_image_index: usize,
-
-    window: Arc<Window>,
 }
 
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self> {
-        unsafe { Self::init(window) }
+        unsafe { Self::init_windowed(window) }
     }
 
-    unsafe fn init(window: Arc<Window>) -> Result<Self> {
+    pub fn new_offscreen(width: u32, height: u32) -> Result<Self> {
+        unsafe { Self::init_offscreen(width, height) }
+    }
+
+    unsafe fn init_windowed(window: Arc<Window>) -> Result<Self> {
         use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
         let entry = ash::Entry::load().context("load Vulkan — is a Vulkan driver installed?")?;
@@ -252,7 +262,7 @@ impl Renderer {
             .create_device(physical_device, &device_info, None)
             .context("create device")?;
         let graphics_queue = device.get_device_queue(graphics_family, 0);
-        let present_queue = device.get_device_queue(present_family, 0);
+        let present_queue  = device.get_device_queue(present_family, 0);
 
         // --- Command pool ---
         let command_pool = device
@@ -291,7 +301,7 @@ impl Renderer {
 
         // --- Render pass ---
         let render_pass =
-            create_render_pass(&device, swapchain_format).context("render pass")?;
+            create_render_pass(&device, swapchain_format, vk::ImageLayout::PRESENT_SRC_KHR).context("render pass")?;
 
         // --- Descriptor set layout (set 0: frame UBO) ---
         let descriptor_set_layout = create_descriptor_set_layout(&device)?;
@@ -505,6 +515,19 @@ impl Renderer {
             );
         }
 
+        let render_target = RenderTarget::Window {
+            window,
+            surface_loader,
+            surface,
+            swapchain_loader,
+            swapchain,
+            present_queue,
+            present_family,
+            image_available,
+            render_finished,
+            next_semaphore: 0,
+        };
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -514,16 +537,11 @@ impl Renderer {
             debug_messenger,
             #[cfg(debug_assertions)]
             enable_validation,
-            surface_loader,
-            surface,
             physical_device,
             device,
             graphics_queue,
-            present_queue,
             graphics_family,
-            present_family,
-            swapchain_loader,
-            swapchain,
+            render_target,
             swapchain_images,
             swapchain_image_views,
             swapchain_format,
@@ -553,13 +571,423 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             index_count,
-            image_available,
-            render_finished,
             in_flight,
             current_frame: 0,
-            next_semaphore: 0,
             last_image_index: 0,
-            window,
+        })
+    }
+
+    unsafe fn init_offscreen(width: u32, height: u32) -> Result<Self> {
+        let entry = ash::Entry::load().context("load Vulkan — is a Vulkan driver installed?")?;
+
+        // --- Instance (no window extensions) ---
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"lightbender")
+            .application_version(vk::make_api_version(0, 0, 1, 0))
+            .engine_name(c"lightbender")
+            .api_version(vk::API_VERSION_1_0);
+
+        let mut required_exts: Vec<*const i8> = vec![];
+
+        let validation_layer = c"VK_LAYER_KHRONOS_validation";
+        let available_layers = entry.enumerate_instance_layer_properties()?;
+        let has_validation = available_layers.iter().any(|l| {
+            l.layer_name_as_c_str()
+                .map(|n| n == validation_layer)
+                .unwrap_or(false)
+        });
+
+        #[cfg(debug_assertions)]
+        let enable_validation = has_validation;
+        #[cfg(not(debug_assertions))]
+        let enable_validation = false;
+
+        if cfg!(debug_assertions) && !has_validation {
+            log::warn!("VK_LAYER_KHRONOS_validation not available — running without validation");
+        }
+        if enable_validation {
+            required_exts.push(ash::ext::debug_utils::NAME.as_ptr());
+        }
+
+        // MoltenVK portability
+        let available_instance_exts = entry.enumerate_instance_extension_properties(None)?;
+        let has_portability_enumeration = available_instance_exts.iter().any(|e| {
+            e.extension_name_as_c_str()
+                .map(|n| n == ash::khr::portability_enumeration::NAME)
+                .unwrap_or(false)
+        });
+        let mut instance_flags = vk::InstanceCreateFlags::empty();
+        if has_portability_enumeration {
+            required_exts.push(ash::khr::portability_enumeration::NAME.as_ptr());
+            instance_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+            let has_props2 = available_instance_exts.iter().any(|e| {
+                e.extension_name_as_c_str()
+                    .map(|n| n == ash::khr::get_physical_device_properties2::NAME)
+                    .unwrap_or(false)
+            });
+            if has_props2 {
+                required_exts.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+            }
+        }
+
+        let layer_ptrs: Vec<*const i8> = if enable_validation {
+            vec![validation_layer.as_ptr()]
+        } else {
+            vec![]
+        };
+
+        let instance_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .flags(instance_flags)
+            .enabled_extension_names(&required_exts)
+            .enabled_layer_names(&layer_ptrs);
+
+        let instance = entry
+            .create_instance(&instance_info, None)
+            .context("create instance")?;
+
+        // --- Debug messenger ---
+        #[cfg(debug_assertions)]
+        let (debug_utils, debug_messenger) = if enable_validation {
+            let du = ash::ext::debug_utils::Instance::new(&entry, &instance);
+            let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                .message_severity(
+                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
+                )
+                .message_type(
+                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                )
+                .pfn_user_callback(Some(vulkan_debug_callback));
+            let messenger = du
+                .create_debug_utils_messenger(&info, None)
+                .context("debug messenger")?;
+            (du, messenger)
+        } else {
+            (
+                ash::ext::debug_utils::Instance::new(&entry, &instance),
+                vk::DebugUtilsMessengerEXT::null(),
+            )
+        };
+
+        // --- Physical device (headless — no surface) ---
+        let (physical_device, graphics_family) = pick_physical_device_headless(&instance)?;
+
+        // --- Logical device (no swapchain extension) ---
+        let queue_priorities = [1.0f32];
+        let queue_infos = vec![vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(graphics_family)
+            .queue_priorities(&queue_priorities)];
+
+        let mut device_exts: Vec<*const i8> = vec![];
+        let dev_ext_props =
+            instance.enumerate_device_extension_properties(physical_device)?;
+        let has_portability_subset = dev_ext_props.iter().any(|e| {
+            e.extension_name_as_c_str()
+                .map(|n| n == ash::khr::portability_subset::NAME)
+                .unwrap_or(false)
+        });
+        if has_portability_subset {
+            device_exts.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
+
+        let features = vk::PhysicalDeviceFeatures::default().sampler_anisotropy(true);
+        let device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_infos)
+            .enabled_extension_names(&device_exts)
+            .enabled_features(&features);
+
+        let device = instance
+            .create_device(physical_device, &device_info, None)
+            .context("create device")?;
+        let graphics_queue = device.get_device_queue(graphics_family, 0);
+
+        // --- Command pool ---
+        let command_pool = device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(graphics_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .context("command pool")?;
+
+        // --- Offscreen color image ---
+        let swapchain_format = vk::Format::B8G8R8A8_SRGB;
+        let swapchain_extent = vk::Extent2D { width, height };
+
+        let color_image = device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(swapchain_format)
+                .extent(vk::Extent3D { width, height, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        ).context("create offscreen color image")?;
+
+        let mem_reqs = device.get_image_memory_requirements(color_image);
+        let mem_type = crate::vulkan::buffer::find_memory_type(
+            &instance,
+            physical_device,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let color_image_memory = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_reqs.size)
+                .memory_type_index(mem_type),
+            None,
+        ).context("offscreen color image memory")?;
+        device.bind_image_memory(color_image, color_image_memory, 0)?;
+
+        let color_image_view = device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(color_image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(swapchain_format)
+                .components(vk::ComponentMapping::default())
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }),
+            None,
+        ).context("offscreen color image view")?;
+
+        let swapchain_images = vec![color_image];
+        let swapchain_image_views = vec![color_image_view];
+
+        // --- Depth image ---
+        let (depth_image, depth_image_memory, depth_image_view) = create_depth_image(
+            &device, &instance, physical_device, swapchain_extent, command_pool, graphics_queue,
+        )?;
+
+        // --- Render pass (COLOR_ATTACHMENT_OPTIMAL final layout for offscreen) ---
+        let render_pass =
+            create_render_pass(&device, swapchain_format, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .context("render pass")?;
+
+        // --- Descriptor set layouts ---
+        let descriptor_set_layout = create_descriptor_set_layout(&device)?;
+        let material_set_layout = create_material_set_layout(&device)?;
+        let env_set_layout = create_env_set_layout(&device)?;
+
+        // --- Pipeline cache ---
+        let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
+        let pipeline_cache = device.create_pipeline_cache(
+            &vk::PipelineCacheCreateInfo::default().initial_data(&cache_data),
+            None,
+        ).context("pipeline cache")?;
+
+        // --- Pipeline ---
+        let (pipeline_layout, default_pipeline) =
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None)
+                .context("pipeline")?;
+        let mut pipelines = HashMap::new();
+        pipelines.insert("default".to_string(), default_pipeline);
+
+        // --- Skybox pipeline ---
+        let skybox_pipeline = create_skybox_pipeline(
+            &device, render_pass, pipeline_layout, pipeline_cache,
+        ).context("skybox pipeline")?;
+
+        // --- Framebuffers ---
+        let framebuffers = create_framebuffers(
+            &device, render_pass, &swapchain_image_views, depth_image_view, swapchain_extent,
+        )?;
+
+        // --- Command buffers (just 1 for offscreen) ---
+        let command_buffers = device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .context("command buffers")?;
+
+        // --- Per-frame UBO (just 1) ---
+        let ubo_size = std::mem::size_of::<FrameUniforms>() as vk::DeviceSize;
+        let ubo_buffers = vec![GpuBuffer::new(
+            &device, &instance, physical_device, ubo_size,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?];
+
+        // --- Descriptor pool + sets ---
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+        }];
+        let descriptor_pool = device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&pool_sizes)
+                    .max_sets(1),
+                None,
+            )
+            .context("descriptor pool")?;
+
+        let layouts = vec![descriptor_set_layout; 1];
+        let descriptor_sets = device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+            .context("descriptor sets")?;
+
+        for (i, &ds) in descriptor_sets.iter().enumerate() {
+            let buf_info = [vk::DescriptorBufferInfo {
+                buffer: ubo_buffers[i].buffer,
+                offset: 0,
+                range:  ubo_size,
+            }];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buf_info);
+            device.update_descriptor_sets(&[write], &[]);
+        }
+
+        // --- Environment map fallback + descriptor sets ---
+        let env_fallback_pixels: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+        let env_fallback_image = GpuImage::upload_rgba32f(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            1, 1, &env_fallback_pixels,
+        ).context("env fallback texture")?;
+        let env_fallback_sampler = device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        ).context("env fallback sampler")?;
+        let env_fallback_texture = GpuTexture {
+            image: env_fallback_image,
+            sampler: env_fallback_sampler,
+        };
+
+        let env_pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+        }];
+        let env_descriptor_pool = device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&env_pool_sizes)
+                    .max_sets(1),
+                None,
+            )
+            .context("env descriptor pool")?;
+
+        let env_layouts = vec![env_set_layout; 1];
+        let env_descriptor_sets = device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(env_descriptor_pool)
+                    .set_layouts(&env_layouts),
+            )
+            .context("env descriptor sets")?;
+
+        for &ds in &env_descriptor_sets {
+            let image_info = [vk::DescriptorImageInfo {
+                sampler: env_fallback_texture.sampler,
+                image_view: env_fallback_texture.image.view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info);
+            device.update_descriptor_sets(&[write], &[]);
+        }
+
+        // --- Hardcoded cube mesh ---
+        let (vertices, indices) = cube_mesh();
+        let vertex_buffer = upload_to_device_local(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            vk::BufferUsageFlags::VERTEX_BUFFER, &vertices,
+        )?;
+        let index_buffer = upload_to_device_local(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            vk::BufferUsageFlags::INDEX_BUFFER, &indices,
+        )?;
+        let index_count = indices.len() as u32;
+
+        // --- Sync (just 1 fence) ---
+        let in_flight = vec![device
+            .create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+            .context("fence")?];
+
+        let render_target = RenderTarget::Offscreen {
+            color_image,
+            color_image_memory,
+        };
+
+        Ok(Self {
+            _entry: entry,
+            instance,
+            #[cfg(debug_assertions)]
+            debug_utils,
+            #[cfg(debug_assertions)]
+            debug_messenger,
+            #[cfg(debug_assertions)]
+            enable_validation,
+            physical_device,
+            device,
+            graphics_queue,
+            graphics_family,
+            render_target,
+            swapchain_images,
+            swapchain_image_views,
+            swapchain_format,
+            swapchain_extent,
+            depth_image,
+            depth_image_memory,
+            depth_image_view,
+            render_pass,
+            descriptor_set_layout,
+            material_set_layout,
+            env_set_layout,
+            pipeline_layout,
+            pipeline_cache,
+            pipelines,
+            skybox_pipeline,
+            framebuffers,
+            command_pool,
+            command_buffers,
+            ubo_buffers,
+            descriptor_pool,
+            descriptor_sets,
+            env_intensity: 1.0,
+            env_texture: None,
+            env_fallback_texture,
+            env_descriptor_pool,
+            env_descriptor_sets,
+            vertex_buffer,
+            index_buffer,
+            index_count,
+            in_flight,
+            current_frame: 0,
+            last_image_index: 0,
         })
     }
 
@@ -568,21 +996,35 @@ impl Renderer {
     }
 
     unsafe fn draw_frame_inner(&mut self, camera: &Camera, scene: Option<&Scene>) -> Result<()> {
+        let RenderTarget::Window {
+            ref window,
+            ref swapchain_loader,
+            swapchain,
+            present_queue,
+            ref mut image_available,
+            ref render_finished,
+            ref mut next_semaphore,
+            ..
+        } = self.render_target
+        else {
+            anyhow::bail!("draw_frame called on offscreen renderer — use draw_frame_offscreen");
+        };
+
         let frame = self.current_frame;
 
         self.device
             .wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)?;
 
-        let size = self.window.inner_size();
+        let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return Ok(()); // minimized — nothing to draw
         }
 
-        let acquire_sem = self.image_available[self.next_semaphore];
-        self.next_semaphore = (self.next_semaphore + 1) % self.image_available.len();
+        let acquire_sem = image_available[*next_semaphore];
+        *next_semaphore = (*next_semaphore + 1) % image_available.len();
 
-        let (image_index, suboptimal) = match self.swapchain_loader.acquire_next_image(
-            self.swapchain,
+        let (image_index, suboptimal) = match swapchain_loader.acquire_next_image(
+            swapchain,
             u64::MAX,
             acquire_sem,
             vk::Fence::null(),
@@ -610,43 +1052,80 @@ impl Renderer {
         self.record_commands(cmd, image_index as usize, frame, scene)?;
 
         let wait_semaphores = [acquire_sem];
-        let signal_semaphores = [self.render_finished[image_index as usize]];
+        let signal_semaphores = [render_finished[image_index as usize]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let command_buffers = [cmd];
+        let command_buffers_arr = [cmd];
         let submit_info = vk::SubmitInfo::default()
             .wait_semaphores(&wait_semaphores)
             .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&command_buffers)
+            .command_buffers(&command_buffers_arr)
             .signal_semaphores(&signal_semaphores);
 
         self.device
             .queue_submit(self.graphics_queue, &[submit_info], self.in_flight[frame])?;
 
-        let swapchains = [self.swapchain];
+        let swapchains = [swapchain];
         let image_indices = [image_index];
         let present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&signal_semaphores)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        let present_result = self
-            .swapchain_loader
-            .queue_present(self.present_queue, &present_info);
+        let present_result = swapchain_loader
+            .queue_present(present_queue, &present_info);
 
         self.current_frame = (self.current_frame + 1) % FRAMES_IN_FLIGHT;
 
         match present_result {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                let sz = self.window.inner_size();
+                let sz = window.inner_size();
                 self.rebuild_swapchain(sz.width, sz.height)?;
             }
             Ok(false) if suboptimal => {
-                let sz = self.window.inner_size();
+                let sz = window.inner_size();
                 self.rebuild_swapchain(sz.width, sz.height)?;
             }
             Ok(_) => {}
             Err(e) => return Err(e.into()),
         }
+        Ok(())
+    }
+
+    pub fn draw_frame_offscreen(&mut self, camera: &Camera, scene: Option<&Scene>) -> Result<()> {
+        unsafe { self.draw_frame_offscreen_inner(camera, scene) }
+    }
+
+    unsafe fn draw_frame_offscreen_inner(
+        &mut self,
+        camera: &Camera,
+        scene: Option<&Scene>,
+    ) -> Result<()> {
+        assert!(matches!(self.render_target, RenderTarget::Offscreen { .. }));
+
+        let frame = 0;
+        self.device
+            .wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)?;
+        self.device.reset_fences(&[self.in_flight[frame]])?;
+
+        self.last_image_index = 0;
+        self.update_ubo(frame, camera)?;
+
+        let cmd = self.command_buffers[frame];
+        self.device
+            .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+        self.record_commands(cmd, 0, frame, scene)?;
+
+        let command_buffers_arr = [cmd];
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(&command_buffers_arr);
+
+        self.device
+            .queue_submit(self.graphics_queue, &[submit_info], self.in_flight[frame])?;
+
+        // Wait for rendering to complete so capture can read the image
+        self.device
+            .wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)?;
+
         Ok(())
     }
 
@@ -924,11 +1403,22 @@ impl Renderer {
         let src_image = self.swapchain_images[self.last_image_index];
         let cmd = begin_one_shot(&self.device, self.command_pool)?;
 
-        // Transition swapchain image to TRANSFER_SRC
+        let (old_layout, restore_layout) = match &self.render_target {
+            RenderTarget::Window { .. } => (
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            ),
+            RenderTarget::Offscreen { .. } => (
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            ),
+        };
+
+        // Transition image to TRANSFER_SRC
         let barrier_to_src = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_READ)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .old_layout(old_layout)
             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -971,12 +1461,12 @@ impl Renderer {
             &[region],
         );
 
-        // Transition swapchain image back to PRESENT_SRC
+        // Transition image back to original layout
         let barrier_back = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_READ)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ)
             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .new_layout(restore_layout)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(src_image)
@@ -1028,6 +1518,22 @@ impl Renderer {
     }
 
     unsafe fn rebuild_swapchain(&mut self, width: u32, height: u32) -> Result<()> {
+        let RenderTarget::Window {
+            ref window,
+            ref surface_loader,
+            surface,
+            ref swapchain_loader,
+            ref mut swapchain,
+            present_family,
+            ref mut image_available,
+            ref mut render_finished,
+            ref mut next_semaphore,
+            ..
+        } = self.render_target
+        else {
+            anyhow::bail!("rebuild_swapchain called on offscreen renderer");
+        };
+
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -1043,47 +1549,47 @@ impl Renderer {
         self.device.destroy_image(self.depth_image, None);
         self.device.free_memory(self.depth_image_memory, None);
 
-        let old_swapchain = self.swapchain;
-        let (swapchain, images, image_views, format, extent) = create_swapchain(
+        let old_swapchain = *swapchain;
+        let (new_swapchain, images, image_views, format, extent) = create_swapchain(
             &self.device,
             self.physical_device,
-            &self.surface_loader,
-            self.surface,
+            surface_loader,
+            surface,
             self.graphics_family,
-            self.present_family,
-            &self.swapchain_loader,
+            present_family,
+            swapchain_loader,
             old_swapchain,
-            &self.window,
+            window,
         )?;
-        self.swapchain_loader.destroy_swapchain(old_swapchain, None);
+        swapchain_loader.destroy_swapchain(old_swapchain, None);
 
-        self.swapchain = swapchain;
+        *swapchain = new_swapchain;
         self.swapchain_image_views = image_views;
         self.swapchain_format = format;
         self.swapchain_extent = extent;
 
         // Rebuild semaphores if swapchain image count changed
         if images.len() != self.swapchain_images.len() {
-            for sem in self.image_available.drain(..) {
+            for sem in image_available.drain(..) {
                 self.device.destroy_semaphore(sem, None);
             }
-            for sem in self.render_finished.drain(..) {
+            for sem in render_finished.drain(..) {
                 self.device.destroy_semaphore(sem, None);
             }
             for _ in 0..images.len() {
-                self.image_available.push(
+                image_available.push(
                     self.device
                         .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                         .context("semaphore")?,
                 );
-                self.render_finished.push(
+                render_finished.push(
                     self.device
                         .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                         .context("semaphore")?,
                 );
             }
         }
-        self.next_semaphore = 0;
+        *next_semaphore = 0;
         self.swapchain_images = images;
 
         let (di, dim, div) = create_depth_image(
@@ -1115,13 +1621,29 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
-            for sem in &self.image_available {
-                self.device.destroy_semaphore(*sem, None);
+            match &self.render_target {
+                RenderTarget::Window {
+                    image_available,
+                    render_finished,
+                    ..
+                } => {
+                    for sem in image_available {
+                        self.device.destroy_semaphore(*sem, None);
+                    }
+                    for sem in render_finished {
+                        self.device.destroy_semaphore(*sem, None);
+                    }
+                }
+                RenderTarget::Offscreen {
+                    color_image,
+                    color_image_memory,
+                } => {
+                    self.device.destroy_image(*color_image, None);
+                    self.device.free_memory(*color_image_memory, None);
+                }
             }
-            for sem in &self.render_finished {
-                self.device.destroy_semaphore(*sem, None);
-            }
-            for i in 0..FRAMES_IN_FLIGHT {
+
+            for i in 0..self.in_flight.len() {
                 self.device.destroy_fence(self.in_flight[i], None);
             }
 
@@ -1177,8 +1699,19 @@ impl Drop for Renderer {
 
             self.device.destroy_render_pass(self.render_pass, None);
 
-            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
-            self.surface_loader.destroy_surface(self.surface, None);
+            match &self.render_target {
+                RenderTarget::Window {
+                    swapchain_loader,
+                    swapchain,
+                    surface_loader,
+                    surface,
+                    ..
+                } => {
+                    swapchain_loader.destroy_swapchain(*swapchain, None);
+                    surface_loader.destroy_surface(*surface, None);
+                }
+                RenderTarget::Offscreen { .. } => {}
+            }
 
             #[cfg(debug_assertions)]
             if self.enable_validation && self.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
@@ -1249,6 +1782,45 @@ unsafe fn pick_physical_device(
         props.device_name_as_c_str().unwrap_or(c"unknown").to_str().unwrap_or("unknown")
     );
     Ok((dev, gfx, prs))
+}
+
+unsafe fn pick_physical_device_headless(
+    instance: &ash::Instance,
+) -> Result<(vk::PhysicalDevice, u32)> {
+    let devices = instance.enumerate_physical_devices()?;
+    let mut best: Option<(vk::PhysicalDevice, u32, u32)> = None;
+
+    for dev in devices {
+        let props = instance.get_physical_device_properties(dev);
+        let queue_families = instance.get_physical_device_queue_family_properties(dev);
+
+        let mut graphics_family = None;
+        for (i, qf) in queue_families.iter().enumerate() {
+            if qf.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                graphics_family = Some(i as u32);
+                break;
+            }
+        }
+
+        if let Some(gfx) = graphics_family {
+            let score = match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 1000,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 100,
+                _ => 1,
+            };
+            if best.is_none() || score > best.unwrap().2 {
+                best = Some((dev, gfx, score));
+            }
+        }
+    }
+
+    let (dev, gfx, _) = best.context("no suitable Vulkan device found")?;
+    let props = instance.get_physical_device_properties(dev);
+    log::info!(
+        "Using GPU: {}",
+        props.device_name_as_c_str().unwrap_or(c"unknown").to_str().unwrap_or("unknown")
+    );
+    Ok((dev, gfx))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1472,6 +2044,7 @@ unsafe fn create_depth_image(
 unsafe fn create_render_pass(
     device: &ash::Device,
     color_format: vk::Format,
+    color_final_layout: vk::ImageLayout,
 ) -> Result<vk::RenderPass> {
     let attachments = [
         // Color
@@ -1483,7 +2056,7 @@ unsafe fn create_render_pass(
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+            .final_layout(color_final_layout),
         // Depth
         vk::AttachmentDescription::default()
             .format(vk::Format::D32_SFLOAT)
