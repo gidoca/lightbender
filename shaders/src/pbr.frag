@@ -6,10 +6,23 @@ layout(location = 2) in mat3 fragTBN;
 
 layout(location = 0) out vec4 outColor;
 
+struct GpuLight {
+    vec4  positionOrDirection;
+    vec3  color;
+    float intensity;
+    float range;
+    float _pad0;
+    vec2  spotAngles;
+    vec4  _pad1;
+};
+
 layout(set = 0, binding = 0) uniform FrameUniforms {
-    mat4 view;
-    mat4 projection;
-    vec4 cameraPosition;
+    mat4     view;
+    mat4     projection;
+    vec4     cameraPosition;
+    GpuLight lights[8];
+    uint     lightCount;
+    float    envIntensity;
 } frame;
 
 // Material textures (set 1)
@@ -18,6 +31,9 @@ layout(set = 1, binding = 1) uniform sampler2D texNormal;
 layout(set = 1, binding = 2) uniform sampler2D texMetallicRoughness;
 layout(set = 1, binding = 3) uniform sampler2D texOcclusion;
 layout(set = 1, binding = 4) uniform sampler2D texEmissive;
+
+// Environment map (set 2)
+layout(set = 2, binding = 0) uniform sampler2D envMap;
 
 const float PI = 3.14159265359;
 
@@ -43,6 +59,12 @@ float geometrySmith(float NdotV, float NdotL, float roughness) {
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec2 directionToEquirect(vec3 dir) {
+    float phi   = atan(dir.z, dir.x);
+    float theta = asin(clamp(dir.y, -1.0, 1.0));
+    return vec2(phi / (2.0 * PI) + 0.5, -theta / PI + 0.5);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -96,8 +118,16 @@ void main() {
         Lo += (kD * albedo / PI + specular) * lightColor * NdotL;
     }
 
-    // Ambient (IBL approximation)
-    vec3 ambient = vec3(0.03) * albedo * occlusion;
+    // Image-based lighting (IBL) from environment map
+    vec3 irradiance = texture(envMap, directionToEquirect(N)).rgb;
+    vec3 diffuseIBL = irradiance * albedo * (1.0 - metallic);
+
+    vec3 R = reflect(-V, N);
+    vec3 specEnv = texture(envMap, directionToEquirect(R)).rgb;
+    vec3 F_ibl = fresnelSchlick(max(dot(N, V), 0.0), F0);
+    vec3 specularIBL = specEnv * F_ibl;
+
+    vec3 ambient = (diffuseIBL + specularIBL) * occlusion * frame.envIntensity;
 
     vec3 color = ambient + Lo + emissive * 3.0;
 

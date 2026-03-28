@@ -1,0 +1,34 @@
+{
+  "camera": {
+    "target":   [0.0, 0.0, 0.0],
+    "distance": 2.5,
+    "yaw":      30.0,
+    "pitch":    15.0,
+    "fov_y":    45.0
+  },
+  "lights": [
+    {
+      "type":      "directional",
+      "direction": [-0.5, -1.0, -0.5],
+      "color":     [1.0, 0.95, 0.85],
+      "intensity": 1.0
+    }
+  ],
+  "shaders": {
+    "pbr": {
+      "vert": "../shaders/compiled/pbr.vert.spv",
+      "frag": "../shaders/compiled/pbr.frag.spv"
+    }
+  },
+  "models": [
+    {
+      "name":   "helmet",
+      "path":   "../../glTF-Sample-Models/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
+      "shader": "pbr"
+    }
+  ],
+  "environment": {
+    "map": "../../mitsuba-examples/living-room/living-room/living-room/textures/Sky 19.exr",
+    "map_intensity": 0.01
+  }
+}
