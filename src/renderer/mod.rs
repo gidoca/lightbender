@@ -82,10 +82,14 @@ pub struct Renderer {
     index_buffer: GpuBuffer,
     index_count: u32,
 
+    /// One per swapchain image — cycled through for acquire
     image_available: Vec<vk::Semaphore>,
+    /// One per swapchain image — indexed by acquired image index
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
     current_frame: usize,
+    /// Tracks which image_available semaphore to pass to acquire_next_image
+    next_semaphore: usize,
 
     window: Arc<Window>,
 }
@@ -130,6 +134,29 @@ impl Renderer {
         if enable_validation {
             required_exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
+
+        // MoltenVK requires portability enumeration to discover non-conformant devices
+        let available_instance_exts = entry.enumerate_instance_extension_properties(None)?;
+        let has_portability_enumeration = available_instance_exts.iter().any(|e| {
+            e.extension_name_as_c_str()
+                .map(|n| n == ash::khr::portability_enumeration::NAME)
+                .unwrap_or(false)
+        });
+        let mut instance_flags = vk::InstanceCreateFlags::empty();
+        if has_portability_enumeration {
+            required_exts.push(ash::khr::portability_enumeration::NAME.as_ptr());
+            instance_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+            // Required by VK_KHR_portability_subset on the device side
+            let has_props2 = available_instance_exts.iter().any(|e| {
+                e.extension_name_as_c_str()
+                    .map(|n| n == ash::khr::get_physical_device_properties2::NAME)
+                    .unwrap_or(false)
+            });
+            if has_props2 {
+                required_exts.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+            }
+        }
+
         let layer_ptrs: Vec<*const i8> = if enable_validation {
             vec![validation_layer.as_ptr()]
         } else {
@@ -138,6 +165,7 @@ impl Renderer {
 
         let instance_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
+            .flags(instance_flags)
             .enabled_extension_names(&required_exts)
             .enabled_layer_names(&layer_ptrs);
 
@@ -199,7 +227,20 @@ impl Renderer {
             );
         }
 
-        let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
+        let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
+
+        // MoltenVK devices expose portability_subset — must enable it if present
+        let dev_ext_props =
+            instance.enumerate_device_extension_properties(physical_device)?;
+        let has_portability_subset = dev_ext_props.iter().any(|e| {
+            e.extension_name_as_c_str()
+                .map(|n| n == ash::khr::portability_subset::NAME)
+                .unwrap_or(false)
+        });
+        if has_portability_subset {
+            device_exts.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
+
         let features = vk::PhysicalDeviceFeatures::default().sampler_anisotropy(true);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
@@ -434,10 +475,11 @@ impl Renderer {
         let index_count = indices.len() as u32;
 
         // --- Sync ---
-        let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
-        let mut render_finished = Vec::with_capacity(FRAMES_IN_FLIGHT);
-        let mut in_flight = Vec::with_capacity(FRAMES_IN_FLIGHT);
-        for _ in 0..FRAMES_IN_FLIGHT {
+        // One semaphore per swapchain image to avoid reuse conflicts with the
+        // presentation engine (which holds semaphore refs until re-acquire)
+        let mut image_available = Vec::with_capacity(swapchain_images.len());
+        let mut render_finished = Vec::with_capacity(swapchain_images.len());
+        for _ in 0..swapchain_images.len() {
             image_available.push(
                 device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
@@ -448,6 +490,9 @@ impl Renderer {
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                     .context("semaphore")?,
             );
+        }
+        let mut in_flight = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for _ in 0..FRAMES_IN_FLIGHT {
             in_flight.push(
                 device
                     .create_fence(
@@ -511,6 +556,7 @@ impl Renderer {
             render_finished,
             in_flight,
             current_frame: 0,
+            next_semaphore: 0,
             window,
         })
     }
@@ -530,10 +576,13 @@ impl Renderer {
             return Ok(()); // minimized — nothing to draw
         }
 
+        let acquire_sem = self.image_available[self.next_semaphore];
+        self.next_semaphore = (self.next_semaphore + 1) % self.image_available.len();
+
         let (image_index, suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
             u64::MAX,
-            self.image_available[frame],
+            acquire_sem,
             vk::Fence::null(),
         ) {
             Ok(r) => r,
@@ -557,8 +606,8 @@ impl Renderer {
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         self.record_commands(cmd, image_index as usize, frame, scene)?;
 
-        let wait_semaphores = [self.image_available[frame]];
-        let signal_semaphores = [self.render_finished[frame]];
+        let wait_semaphores = [acquire_sem];
+        let signal_semaphores = [self.render_finished[image_index as usize]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let command_buffers = [cmd];
         let submit_info = vk::SubmitInfo::default()
@@ -863,10 +912,33 @@ impl Renderer {
         self.swapchain_loader.destroy_swapchain(old_swapchain, None);
 
         self.swapchain = swapchain;
-        self.swapchain_images = images;
         self.swapchain_image_views = image_views;
         self.swapchain_format = format;
         self.swapchain_extent = extent;
+
+        // Rebuild semaphores if swapchain image count changed
+        if images.len() != self.swapchain_images.len() {
+            for sem in self.image_available.drain(..) {
+                self.device.destroy_semaphore(sem, None);
+            }
+            for sem in self.render_finished.drain(..) {
+                self.device.destroy_semaphore(sem, None);
+            }
+            for _ in 0..images.len() {
+                self.image_available.push(
+                    self.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .context("semaphore")?,
+                );
+                self.render_finished.push(
+                    self.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .context("semaphore")?,
+                );
+            }
+        }
+        self.next_semaphore = 0;
+        self.swapchain_images = images;
 
         let (di, dim, div) = create_depth_image(
             &self.device,
@@ -897,9 +969,13 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
+            for sem in &self.image_available {
+                self.device.destroy_semaphore(*sem, None);
+            }
+            for sem in &self.render_finished {
+                self.device.destroy_semaphore(*sem, None);
+            }
             for i in 0..FRAMES_IN_FLIGHT {
-                self.device.destroy_semaphore(self.image_available[i], None);
-                self.device.destroy_semaphore(self.render_finished[i], None);
                 self.device.destroy_fence(self.in_flight[i], None);
             }
 
