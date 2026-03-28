@@ -144,6 +144,12 @@ pub struct EnvironmentDesc {
     pub ambient_intensity: f32,
     #[serde(default)]
     pub background_color:  [f32; 3],
+    /// Path to an HDR/EXR equirectangular environment map.
+    #[serde(default)]
+    pub map:               Option<String>,
+    /// Scaling factor for environment map IBL contribution (default 1.0).
+    #[serde(default = "one")]
+    pub map_intensity:     f32,
 }
 
 fn default_ambient() -> f32 { 0.3 }

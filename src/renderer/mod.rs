@@ -7,10 +7,11 @@ use glam::Mat4;
 use winit::window::Window;
 
 use crate::camera::Camera;
-use crate::scene::{gltf_loader::LoadContext, Scene};
+use crate::scene::{gltf_loader::LoadContext, GpuTexture, Scene};
 use crate::shader::ShaderPair;
 use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
+use crate::vulkan::image::GpuImage;
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const PIPELINE_CACHE_FILE: &str = "pipeline_cache.bin";
@@ -51,10 +52,13 @@ pub struct Renderer {
     descriptor_set_layout: vk::DescriptorSetLayout,
     /// Set 1: per-material textures (5× combined image samplers)
     pub material_set_layout: vk::DescriptorSetLayout,
+    /// Set 2: environment map (1× combined image sampler)
+    env_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
     /// "default" pipeline + any user-loaded named pipelines
     pipelines: HashMap<String, vk::Pipeline>,
+    skybox_pipeline: vk::Pipeline,
 
     framebuffers: Vec<vk::Framebuffer>,
 
@@ -65,6 +69,13 @@ pub struct Renderer {
     ubo_buffers: Vec<GpuBuffer>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
+
+    // Environment map
+    env_intensity: f32,
+    env_texture: Option<GpuTexture>,
+    env_fallback_texture: GpuTexture,
+    env_descriptor_pool: vk::DescriptorPool,
+    env_descriptor_sets: Vec<vk::DescriptorSet>,
 
     // Mesh geometry
     vertex_buffer: GpuBuffer,
@@ -246,6 +257,9 @@ impl Renderer {
         // --- Descriptor set layout (set 1: material textures) ---
         let material_set_layout = create_material_set_layout(&device)?;
 
+        // --- Descriptor set layout (set 2: environment map) ---
+        let env_set_layout = create_env_set_layout(&device)?;
+
         // --- Pipeline cache (load from disk if available) ---
         let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
         let pipeline_cache = device.create_pipeline_cache(
@@ -260,10 +274,15 @@ impl Renderer {
 
         // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, pipeline_cache, None)
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None)
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
+
+        // --- Skybox pipeline ---
+        let skybox_pipeline = create_skybox_pipeline(
+            &device, render_pass, pipeline_layout, pipeline_cache,
+        ).context("skybox pipeline")?;
 
         // --- Framebuffers ---
         let framebuffers = create_framebuffers(
@@ -332,6 +351,63 @@ impl Renderer {
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&buf_info);
+            device.update_descriptor_sets(&[write], &[]);
+        }
+
+        // --- Environment map fallback + descriptor sets ---
+        let env_fallback_pixels: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+        let env_fallback_image = GpuImage::upload_rgba32f(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            1, 1, &env_fallback_pixels,
+        ).context("env fallback texture")?;
+        let env_fallback_sampler = device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        ).context("env fallback sampler")?;
+        let env_fallback_texture = GpuTexture {
+            image: env_fallback_image,
+            sampler: env_fallback_sampler,
+        };
+
+        let env_pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: FRAMES_IN_FLIGHT as u32,
+        }];
+        let env_descriptor_pool = device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&env_pool_sizes)
+                    .max_sets(FRAMES_IN_FLIGHT as u32),
+                None,
+            )
+            .context("env descriptor pool")?;
+
+        let env_layouts = vec![env_set_layout; FRAMES_IN_FLIGHT];
+        let env_descriptor_sets = device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(env_descriptor_pool)
+                    .set_layouts(&env_layouts),
+            )
+            .context("env descriptor sets")?;
+
+        // Bind fallback texture to all env descriptor sets
+        for &ds in &env_descriptor_sets {
+            let image_info = [vk::DescriptorImageInfo {
+                sampler: env_fallback_texture.sampler,
+                image_view: env_fallback_texture.image.view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info);
             device.update_descriptor_sets(&[write], &[]);
         }
 
@@ -412,15 +488,22 @@ impl Renderer {
             render_pass,
             descriptor_set_layout,
             material_set_layout,
+            env_set_layout,
             pipeline_layout,
             pipeline_cache,
             pipelines,
+            skybox_pipeline,
             framebuffers,
             command_pool,
             command_buffers,
             ubo_buffers,
             descriptor_pool,
             descriptor_sets,
+            env_intensity: 1.0,
+            env_texture: None,
+            env_fallback_texture,
+            env_descriptor_pool,
+            env_descriptor_sets,
             vertex_buffer,
             index_buffer,
             index_count,
@@ -529,7 +612,8 @@ impl Renderer {
             camera_position: [eye.x, eye.y, eye.z, 1.0],
             lights: [Default::default(); MAX_LIGHTS],
             light_count: 0,
-            _pad: [0; 3],
+            env_intensity: self.env_intensity,
+            _pad: [0; 2],
         };
         self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))
     }
@@ -600,6 +684,22 @@ impl Renderer {
             &[],
         );
 
+        // Bind environment map descriptor set (set 2)
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline_layout,
+            2,
+            &[self.env_descriptor_sets[frame]],
+            &[],
+        );
+
+        // Draw skybox if environment map is loaded
+        if self.env_texture.is_some() {
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.skybox_pipeline);
+            self.device.cmd_draw(cmd, 3, 1, 0, 0);
+        }
+
         if let Some(scene) = scene {
             for (world, prim) in scene.draw_primitives() {
                 let mat = &scene.materials[prim.material];
@@ -667,6 +767,7 @@ impl Renderer {
                 self.render_pass,
                 self.descriptor_set_layout,
                 self.material_set_layout,
+                self.env_set_layout,
                 self.pipeline_cache,
                 Some(pair),
             )?;
@@ -694,6 +795,36 @@ impl Renderer {
             command_pool:        self.command_pool,
             queue:               self.graphics_queue,
             material_set_layout: self.material_set_layout,
+        }
+    }
+
+    /// Set the environment map texture and IBL intensity. Updates all env descriptor sets.
+    pub fn set_environment_map(&mut self, texture: GpuTexture, intensity: f32) {
+        self.env_intensity = intensity;
+        unsafe {
+            self.device.device_wait_idle().ok();
+
+            // Update descriptor sets to point to the new texture
+            for &ds in &self.env_descriptor_sets {
+                let image_info = [vk::DescriptorImageInfo {
+                    sampler: texture.sampler,
+                    image_view: texture.image.view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }];
+                let write = vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_info);
+                self.device.update_descriptor_sets(&[write], &[]);
+            }
+
+            // Destroy old env texture if any
+            if let Some(old) = self.env_texture.take() {
+                old.destroy(&self.device);
+            }
+
+            self.env_texture = Some(texture);
         }
     }
 
@@ -782,6 +913,14 @@ impl Drop for Renderer {
             self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_descriptor_set_layout(self.material_set_layout, None);
 
+            // Environment map cleanup
+            if let Some(env_tex) = &self.env_texture {
+                env_tex.destroy(&self.device);
+            }
+            self.env_fallback_texture.destroy(&self.device);
+            self.device.destroy_descriptor_pool(self.env_descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.env_set_layout, None);
+
             self.device.destroy_command_pool(self.command_pool, None);
 
             for fb in &self.framebuffers {
@@ -798,6 +937,7 @@ impl Drop for Renderer {
             for pipeline in self.pipelines.values() {
                 self.device.destroy_pipeline(*pipeline, None);
             }
+            self.device.destroy_pipeline(self.skybox_pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
 
             // Save pipeline cache to disk for faster startup next time
@@ -1208,6 +1348,7 @@ unsafe fn create_pipeline(
     render_pass: vk::RenderPass,
     descriptor_set_layout: vk::DescriptorSetLayout,
     material_set_layout: vk::DescriptorSetLayout,
+    env_set_layout: vk::DescriptorSetLayout,
     pipeline_cache: vk::PipelineCache,
     // Pre-loaded shader modules to use. If None, loads the built-in mesh shaders.
     shader_pair: Option<&ShaderPair>,
@@ -1299,7 +1440,7 @@ unsafe fn create_pipeline(
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-    let set_layouts = [descriptor_set_layout, material_set_layout];
+    let set_layouts = [descriptor_set_layout, material_set_layout, env_set_layout];
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::VERTEX)
         .offset(0)
@@ -1339,6 +1480,108 @@ unsafe fn create_pipeline(
     }
 
     Ok((layout, pipelines[0]))
+}
+
+unsafe fn create_env_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+    Ok(device.create_descriptor_set_layout(
+        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+        None,
+    )?)
+}
+
+unsafe fn create_skybox_pipeline(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline_cache: vk::PipelineCache,
+) -> Result<vk::Pipeline> {
+    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/skybox.vert.spv"))
+        .context("load skybox vertex shader")?;
+    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/skybox.frag.spv"))
+        .context("load skybox fragment shader")?;
+    let vert_module = device
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
+        .context("skybox vert shader module")?;
+    let frag_module = device
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)
+        .context("skybox frag shader module")?;
+
+    let entry_point = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry_point),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(entry_point),
+    ];
+
+    // No vertex input for fullscreen triangle
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    // Depth test enabled (LESS_OR_EQUAL to pass at z=1.0), but no depth write
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(false)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+        .depth_bounds_test_enable(false);
+
+    let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA);
+    let blend_attachments = [blend_attachment];
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0);
+
+    let pipelines = device
+        .create_graphics_pipelines(pipeline_cache, &[pipeline_info], None)
+        .map_err(|(_, e)| e)
+        .context("skybox graphics pipeline")?;
+
+    device.destroy_shader_module(vert_module, None);
+    device.destroy_shader_module(frag_module, None);
+
+    Ok(pipelines[0])
 }
 
 unsafe fn create_framebuffers(

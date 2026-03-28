@@ -13,8 +13,9 @@ use winit::{
 use crate::camera::OrbitalCamera;
 use crate::input::InputState;
 use crate::renderer::Renderer;
-use crate::scene::{gltf_loader, loader, Scene};
+use crate::scene::{gltf_loader, loader, GpuTexture, Scene};
 use crate::shader::ShaderLibrary;
+use crate::vulkan::image::{load_hdr_to_rgba32f, GpuImage};
 
 pub enum InputPath {
     Model(PathBuf),
@@ -115,6 +116,23 @@ impl App {
                         // Shader modules can be destroyed after pipeline creation
                         unsafe { lib.destroy(renderer.device()); }
 
+                        // Load environment map if specified
+                        if let Some(map_path) = &loaded.description.environment.map {
+                            let resolved = if std::path::Path::new(map_path).is_absolute() {
+                                std::path::PathBuf::from(map_path)
+                            } else {
+                                base.join(map_path)
+                            };
+                            match load_and_upload_env_map(&renderer, &resolved) {
+                                Ok(tex) => {
+                                    let intensity = loaded.description.environment.map_intensity;
+                                    renderer.set_environment_map(tex, intensity);
+                                    log::info!("Loaded environment map: {} (intensity={})", resolved.display(), intensity);
+                                }
+                                Err(e) => log::error!("Failed to load environment map: {e:#}"),
+                            }
+                        }
+
                         log::info!("Loaded scene: {}", path.display());
                         Some(loaded.scene)
                     }
@@ -213,4 +231,37 @@ impl ApplicationHandler for App {
             state.window.request_redraw();
         }
     }
+}
+
+fn load_and_upload_env_map(
+    renderer: &Renderer,
+    path: &std::path::Path,
+) -> anyhow::Result<GpuTexture> {
+    use anyhow::Context;
+    use ash::vk;
+
+    let (width, height, pixels) = load_hdr_to_rgba32f(path)?;
+    let ctx = renderer.load_context();
+
+    let image = unsafe {
+        GpuImage::upload_rgba32f(
+            ctx.device, ctx.instance, ctx.physical_device,
+            ctx.command_pool, ctx.queue,
+            width, height, &pixels,
+        ).context("upload environment map")?
+    };
+
+    let sampler = unsafe {
+        ctx.device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        ).context("create env map sampler")?
+    };
+
+    Ok(GpuTexture { image, sampler })
 }
