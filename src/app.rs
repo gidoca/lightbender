@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -12,21 +13,38 @@ use winit::{
 use crate::camera::OrbitalCamera;
 use crate::input::InputState;
 use crate::renderer::Renderer;
+use crate::scene::{gltf_loader, Scene};
 
 pub struct App {
+    /// Optional path to a GLB/glTF file to load at startup.
+    pub model_path: Option<PathBuf>,
     state: Option<AppState>,
 }
 
 struct AppState {
     window:   Arc<Window>,
+    // scene must be dropped before renderer (GPU resources freed before device)
+    scene:    Option<Scene>,
     renderer: Renderer,
     camera:   OrbitalCamera,
     input:    InputState,
 }
 
+impl Drop for AppState {
+    fn drop(&mut self) {
+        // Wait for GPU to be idle before destroying scene resources
+        if let Some(scene) = self.scene.take() {
+            unsafe {
+                let _ = self.renderer.device_wait_idle();
+                scene.destroy(self.renderer.device());
+            }
+        }
+    }
+}
+
 impl App {
-    pub fn new() -> Self {
-        Self { state: None }
+    pub fn new(model_path: Option<PathBuf>) -> Self {
+        Self { model_path, state: None }
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -38,9 +56,26 @@ impl App {
             )?,
         );
         let renderer = Renderer::new(window.clone())?;
-        let camera   = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
-        let input    = InputState::default();
-        self.state = Some(AppState { window, renderer, camera, input });
+
+        let scene = if let Some(path) = &self.model_path {
+            let ctx = renderer.load_context();
+            match gltf_loader::load(&ctx, path) {
+                Ok(s) => {
+                    log::info!("Loaded model: {}", path.display());
+                    Some(s)
+                }
+                Err(e) => {
+                    log::error!("Failed to load model: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let camera = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
+        let input  = InputState::default();
+        self.state = Some(AppState { window, scene, renderer, camera, input });
         Ok(())
     }
 }
@@ -110,7 +145,7 @@ impl ApplicationHandler for App {
                 state.camera.update(&state.input);
                 state.input.flush();
 
-                match state.renderer.draw_frame(&state.camera.camera) {
+                match state.renderer.draw_frame(&state.camera.camera, state.scene.as_ref()) {
                     Ok(_) => {}
                     Err(e) => {
                         log::error!("draw_frame failed: {e:#}");

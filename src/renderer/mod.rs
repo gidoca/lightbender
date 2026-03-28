@@ -6,6 +6,7 @@ use glam::Mat4;
 use winit::window::Window;
 
 use crate::camera::Camera;
+use crate::scene::{gltf_loader::LoadContext, Scene};
 use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 
@@ -43,7 +44,10 @@ pub struct Renderer {
     depth_image_view: vk::ImageView,
 
     render_pass: vk::RenderPass,
+    /// Set 0: per-frame UBO
     descriptor_set_layout: vk::DescriptorSetLayout,
+    /// Set 1: per-material textures (5× combined image samplers)
+    pub material_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 
@@ -234,9 +238,12 @@ impl Renderer {
         // --- Descriptor set layout (set 0: frame UBO) ---
         let descriptor_set_layout = create_descriptor_set_layout(&device)?;
 
+        // --- Descriptor set layout (set 1: material textures) ---
+        let material_set_layout = create_material_set_layout(&device)?;
+
         // --- Pipeline ---
         let (pipeline_layout, pipeline) =
-            create_pipeline(&device, render_pass, swapchain_extent, descriptor_set_layout)
+            create_pipeline(&device, render_pass, swapchain_extent, descriptor_set_layout, material_set_layout)
                 .context("pipeline")?;
 
         // --- Framebuffers ---
@@ -385,6 +392,7 @@ impl Renderer {
             depth_image_view,
             render_pass,
             descriptor_set_layout,
+            material_set_layout,
             pipeline_layout,
             pipeline,
             framebuffers,
@@ -404,11 +412,11 @@ impl Renderer {
         })
     }
 
-    pub fn draw_frame(&mut self, camera: &Camera) -> Result<()> {
-        unsafe { self.draw_frame_inner(camera) }
+    pub fn draw_frame(&mut self, camera: &Camera, scene: Option<&Scene>) -> Result<()> {
+        unsafe { self.draw_frame_inner(camera, scene) }
     }
 
-    unsafe fn draw_frame_inner(&mut self, camera: &Camera) -> Result<()> {
+    unsafe fn draw_frame_inner(&mut self, camera: &Camera, scene: Option<&Scene>) -> Result<()> {
         let frame = self.current_frame;
 
         self.device
@@ -437,7 +445,7 @@ impl Renderer {
         let cmd = self.command_buffers[frame];
         self.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-        self.record_commands(cmd, image_index as usize, frame)?;
+        self.record_commands(cmd, image_index as usize, frame, scene)?;
 
         let wait_semaphores = [self.image_available[frame]];
         let signal_semaphores = [self.render_finished[frame]];
@@ -499,6 +507,7 @@ impl Renderer {
         cmd: vk::CommandBuffer,
         image_index: usize,
         frame: usize,
+        scene: Option<&Scene>,
     ) -> Result<()> {
         self.device.begin_command_buffer(
             cmd,
@@ -549,7 +558,7 @@ impl Renderer {
         };
         self.device.cmd_set_scissor(cmd, 0, &[scissor]);
 
-        // Bind frame descriptor set
+        // Bind frame descriptor set (set 0)
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::GRAPHICS,
@@ -559,25 +568,73 @@ impl Renderer {
             &[],
         );
 
-        // Push model matrix as push constant
-        let model = Mat4::IDENTITY;
-        let model_arr = model.to_cols_array_2d();
-        let model_bytes = bytemuck::bytes_of(&model_arr);
-        self.device.cmd_push_constants(
-            cmd,
-            self.pipeline_layout,
-            vk::ShaderStageFlags::VERTEX,
-            0,
-            model_bytes,
-        );
+        if let Some(scene) = scene {
+            for (world, prim) in scene.draw_primitives() {
+                let mat = &scene.materials[prim.material];
 
-        self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.buffer], &[0]);
-        self.device.cmd_bind_index_buffer(cmd, self.index_buffer.buffer, 0, vk::IndexType::UINT32);
-        self.device.cmd_draw_indexed(cmd, self.index_count, 1, 0, 0, 0);
+                // Bind material descriptor set (set 1)
+                self.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    1,
+                    &[mat.descriptor_set],
+                    &[],
+                );
+
+                let model_arr = world.to_cols_array_2d();
+                let model_bytes = bytemuck::bytes_of(&model_arr);
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    model_bytes,
+                );
+
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[prim.vertex_buffer.buffer], &[0]);
+                self.device.cmd_bind_index_buffer(cmd, prim.index_buffer.buffer, 0, vk::IndexType::UINT32);
+                self.device.cmd_draw_indexed(cmd, prim.index_count, 1, 0, 0, 0);
+            }
+        } else {
+            // Fallback: draw the hardcoded cube
+            let model_arr = Mat4::IDENTITY.to_cols_array_2d();
+            let model_bytes = bytemuck::bytes_of(&model_arr);
+            self.device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                model_bytes,
+            );
+            self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.buffer], &[0]);
+            self.device.cmd_bind_index_buffer(cmd, self.index_buffer.buffer, 0, vk::IndexType::UINT32);
+            self.device.cmd_draw_indexed(cmd, self.index_count, 1, 0, 0, 0);
+        }
 
         self.device.cmd_end_render_pass(cmd);
         self.device.end_command_buffer(cmd)?;
         Ok(())
+    }
+
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
+    pub fn device_wait_idle(&self) -> Result<()> {
+        unsafe { Ok(self.device.device_wait_idle()?) }
+    }
+
+    /// Return a LoadContext for the glTF loader to use.
+    pub fn load_context(&self) -> LoadContext {
+        LoadContext {
+            device:              &self.device,
+            instance:            &self.instance,
+            physical_device:     self.physical_device,
+            command_pool:        self.command_pool,
+            queue:               self.graphics_queue,
+            material_set_layout: self.material_set_layout,
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -663,6 +720,7 @@ impl Drop for Renderer {
             }
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.device.destroy_descriptor_set_layout(self.material_set_layout, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
 
@@ -1052,11 +1110,29 @@ unsafe fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::Descr
     )?)
 }
 
+unsafe fn create_material_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    // 5 combined image samplers: base_color, normal, metallic_roughness, occlusion, emissive
+    let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..5u32)
+        .map(|i| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(i)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        })
+        .collect();
+    Ok(device.create_descriptor_set_layout(
+        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+        None,
+    )?)
+}
+
 unsafe fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     _extent: vk::Extent2D,
     descriptor_set_layout: vk::DescriptorSetLayout,
+    material_set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.vert.spv"))
         .context("load vertex shader")?;
@@ -1140,7 +1216,7 @@ unsafe fn create_pipeline(
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-    let set_layouts = [descriptor_set_layout];
+    let set_layouts = [descriptor_set_layout, material_set_layout];
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::VERTEX)
         .offset(0)
