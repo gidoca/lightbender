@@ -62,91 +62,101 @@ impl App {
             )?,
         );
         let mut renderer = Renderer::new(window.clone())?;
-
-        let mut camera = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
-
-        let scene = match &self.input_path {
-            Some(InputPath::Model(path)) => {
-                let ctx = renderer.load_context();
-                match gltf_loader::load(&ctx, path) {
-                    Ok(s) => { log::info!("Loaded: {}", path.display()); Some(s) }
-                    Err(e) => { log::error!("Failed to load model: {e:#}"); None }
-                }
-            }
-            Some(InputPath::Scene(path)) => {
-                match loader::load_scene(&renderer, path) {
-                    Ok(loaded) => {
-                        // Apply camera from scene description
-                        let cd = &loaded.description.camera;
-                        camera = OrbitalCamera::new(
-                            Vec3::from(cd.target),
-                            cd.distance,
-                            cd.yaw,
-                            cd.pitch,
-                        );
-                        camera.camera.fov_y = f32::to_radians(cd.fov_y);
-                        camera.camera.near  = cd.near;
-                        camera.camera.far   = cd.far;
-
-                        // Load named shader pipelines from scene description
-                        let base = path.parent().unwrap_or(std::path::Path::new("."));
-                        let mut lib = ShaderLibrary::new();
-                        for (name, sd) in &loaded.description.shaders {
-                            let vert_path = if std::path::Path::new(&sd.vert).is_absolute() {
-                                std::path::PathBuf::from(&sd.vert)
-                            } else {
-                                base.join(&sd.vert)
-                            };
-                            let frag_path = if std::path::Path::new(&sd.frag).is_absolute() {
-                                std::path::PathBuf::from(&sd.frag)
-                            } else {
-                                base.join(&sd.frag)
-                            };
-                            match unsafe { lib.load(renderer.device(), name, &vert_path, &frag_path) } {
-                                Ok(()) => {
-                                    let pair = lib.pairs.get(name).unwrap();
-                                    if let Err(e) = renderer.add_pipeline(name, pair) {
-                                        log::error!("Failed to build pipeline '{name}': {e:#}");
-                                    } else {
-                                        log::info!("Registered shader pipeline: {name}");
-                                    }
-                                }
-                                Err(e) => log::error!("Failed to load shader '{name}': {e:#}"),
-                            }
-                        }
-                        // Shader modules can be destroyed after pipeline creation
-                        unsafe { lib.destroy(renderer.device()); }
-
-                        // Load environment map if specified
-                        if let Some(map_path) = &loaded.description.environment.map {
-                            let resolved = if std::path::Path::new(map_path).is_absolute() {
-                                std::path::PathBuf::from(map_path)
-                            } else {
-                                base.join(map_path)
-                            };
-                            match load_and_upload_env_map(&renderer, &resolved) {
-                                Ok(tex) => {
-                                    let intensity = loaded.description.environment.map_intensity;
-                                    renderer.set_environment_map(tex, intensity);
-                                    log::info!("Loaded environment map: {} (intensity={})", resolved.display(), intensity);
-                                }
-                                Err(e) => log::error!("Failed to load environment map: {e:#}"),
-                            }
-                        }
-
-                        log::info!("Loaded scene: {}", path.display());
-                        Some(loaded.scene)
-                    }
-                    Err(e) => { log::error!("Failed to load scene: {e:#}"); None }
-                }
-            }
-            None => None,
-        };
+        let (scene, camera) = load_scene_from_input(&mut renderer, self.input_path.as_ref())?;
 
         let input = InputState::default();
         self.state = Some(AppState { window, scene, renderer, camera, input });
         Ok(())
     }
+}
+
+/// Load a scene/model from the given input path, setting up camera, shaders,
+/// and environment maps on the renderer. Used by both windowed and headless paths.
+pub fn load_scene_from_input(
+    renderer: &mut Renderer,
+    input_path: Option<&InputPath>,
+) -> Result<(Option<Scene>, OrbitalCamera)> {
+    let mut camera = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
+
+    let scene = match input_path {
+        Some(InputPath::Model(path)) => {
+            let ctx = renderer.load_context();
+            match gltf_loader::load(&ctx, path) {
+                Ok(s) => { log::info!("Loaded: {}", path.display()); Some(s) }
+                Err(e) => { log::error!("Failed to load model: {e:#}"); None }
+            }
+        }
+        Some(InputPath::Scene(path)) => {
+            match loader::load_scene(renderer, path) {
+                Ok(loaded) => {
+                    // Apply camera from scene description
+                    let cd = &loaded.description.camera;
+                    camera = OrbitalCamera::new(
+                        Vec3::from(cd.target),
+                        cd.distance,
+                        cd.yaw,
+                        cd.pitch,
+                    );
+                    camera.camera.fov_y = f32::to_radians(cd.fov_y);
+                    camera.camera.near  = cd.near;
+                    camera.camera.far   = cd.far;
+
+                    // Load named shader pipelines from scene description
+                    let base = path.parent().unwrap_or(std::path::Path::new("."));
+                    let mut lib = ShaderLibrary::new();
+                    for (name, sd) in &loaded.description.shaders {
+                        let vert_path = if std::path::Path::new(&sd.vert).is_absolute() {
+                            std::path::PathBuf::from(&sd.vert)
+                        } else {
+                            base.join(&sd.vert)
+                        };
+                        let frag_path = if std::path::Path::new(&sd.frag).is_absolute() {
+                            std::path::PathBuf::from(&sd.frag)
+                        } else {
+                            base.join(&sd.frag)
+                        };
+                        match unsafe { lib.load(renderer.device(), name, &vert_path, &frag_path) } {
+                            Ok(()) => {
+                                let pair = lib.pairs.get(name).unwrap();
+                                if let Err(e) = renderer.add_pipeline(name, pair) {
+                                    log::error!("Failed to build pipeline '{name}': {e:#}");
+                                } else {
+                                    log::info!("Registered shader pipeline: {name}");
+                                }
+                            }
+                            Err(e) => log::error!("Failed to load shader '{name}': {e:#}"),
+                        }
+                    }
+                    // Shader modules can be destroyed after pipeline creation
+                    unsafe { lib.destroy(renderer.device()); }
+
+                    // Load environment map if specified
+                    if let Some(map_path) = &loaded.description.environment.map {
+                        let resolved = if std::path::Path::new(map_path).is_absolute() {
+                            std::path::PathBuf::from(map_path)
+                        } else {
+                            base.join(map_path)
+                        };
+                        match load_and_upload_env_map(renderer, &resolved) {
+                            Ok(tex) => {
+                                let intensity = loaded.description.environment.map_intensity;
+                                renderer.set_environment_map(tex, intensity);
+                                log::info!("Loaded environment map: {} (intensity={})", resolved.display(), intensity);
+                            }
+                            Err(e) => log::error!("Failed to load environment map: {e:#}"),
+                        }
+                    }
+
+                    log::info!("Loaded scene: {}", path.display());
+                    Some(loaded.scene)
+                }
+                Err(e) => { log::error!("Failed to load scene: {e:#}"); None }
+            }
+        }
+        None => None,
+    };
+
+    Ok((scene, camera))
 }
 
 impl ApplicationHandler for App {
