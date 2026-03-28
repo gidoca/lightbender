@@ -1,5 +1,7 @@
 mod app;
 mod renderer;
+mod types;
+mod vulkan;
 
 use app::App;
 use winit::event_loop::EventLoop;

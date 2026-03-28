@@ -5,6 +5,9 @@ fn main() {
     let shader_out = "shaders/compiled";
     std::fs::create_dir_all(shader_out).unwrap();
 
+    // Watch the directory itself so new files trigger a rebuild
+    println!("cargo:rerun-if-changed={shader_src}");
+
     let dir = match std::fs::read_dir(shader_src) {
         Ok(d) => d,
         Err(_) => return, // no shaders yet

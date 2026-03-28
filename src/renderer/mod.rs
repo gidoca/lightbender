@@ -2,12 +2,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ash::vk;
+use glam::{Mat4, Vec3};
 use winit::window::Window;
+
+use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
+use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 
 pub struct Renderer {
-    // Keep entry + instance alive
     _entry: ash::Entry,
     instance: ash::Instance,
     #[cfg(debug_assertions)]
@@ -34,7 +37,12 @@ pub struct Renderer {
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
 
+    depth_image: vk::Image,
+    depth_image_memory: vk::DeviceMemory,
+    depth_image_view: vk::ImageView,
+
     render_pass: vk::RenderPass,
+    descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 
@@ -42,6 +50,16 @@ pub struct Renderer {
 
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
+
+    // Per-frame UBOs
+    ubo_buffers: Vec<GpuBuffer>,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+
+    // Mesh geometry
+    vertex_buffer: GpuBuffer,
+    index_buffer: GpuBuffer,
+    index_count: u32,
 
     image_available: Vec<vk::Semaphore>,
     render_finished: Vec<vk::Semaphore>,
@@ -72,7 +90,6 @@ impl Renderer {
         let mut required_exts =
             ash_window::enumerate_required_extensions(display_handle)?.to_vec();
 
-        // Enable validation layer + debug messenger if available in debug builds
         let validation_layer = c"VK_LAYER_KHRONOS_validation";
         let available_layers = entry.enumerate_instance_layer_properties()?;
         let has_validation = available_layers.iter().any(|l| {
@@ -89,11 +106,9 @@ impl Renderer {
         if cfg!(debug_assertions) && !has_validation {
             log::warn!("VK_LAYER_KHRONOS_validation not available — running without validation");
         }
-
         if enable_validation {
             required_exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
-
         let layer_ptrs: Vec<*const i8> = if enable_validation {
             vec![validation_layer.as_ptr()]
         } else {
@@ -109,7 +124,7 @@ impl Renderer {
             .create_instance(&instance_info, None)
             .context("create instance")?;
 
-        // --- Debug messenger (only when validation layer is active) ---
+        // --- Debug messenger ---
         #[cfg(debug_assertions)]
         let (debug_utils, debug_messenger) = if enable_validation {
             let du = ash::ext::debug_utils::Instance::new(&entry, &instance);
@@ -176,11 +191,20 @@ impl Renderer {
         let graphics_queue = device.get_device_queue(graphics_family, 0);
         let present_queue = device.get_device_queue(present_family, 0);
 
+        // --- Command pool ---
+        let command_pool = device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(graphics_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .context("command pool")?;
+
         // --- Swapchain ---
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let (swapchain, swapchain_images, swapchain_image_views, swapchain_format, swapchain_extent) =
             create_swapchain(
-                &instance,
                 &device,
                 physical_device,
                 &surface_loader,
@@ -192,13 +216,26 @@ impl Renderer {
                 &window,
             )?;
 
+        // --- Depth image ---
+        let (depth_image, depth_image_memory, depth_image_view) = create_depth_image(
+            &device,
+            &instance,
+            physical_device,
+            swapchain_extent,
+            command_pool,
+            graphics_queue,
+        )?;
+
         // --- Render pass ---
         let render_pass =
             create_render_pass(&device, swapchain_format).context("render pass")?;
 
+        // --- Descriptor set layout (set 0: frame UBO) ---
+        let descriptor_set_layout = create_descriptor_set_layout(&device)?;
+
         // --- Pipeline ---
         let (pipeline_layout, pipeline) =
-            create_pipeline(&device, render_pass, swapchain_extent)
+            create_pipeline(&device, render_pass, swapchain_extent, descriptor_set_layout)
                 .context("pipeline")?;
 
         // --- Framebuffers ---
@@ -206,19 +243,11 @@ impl Renderer {
             &device,
             render_pass,
             &swapchain_image_views,
+            depth_image_view,
             swapchain_extent,
         )?;
 
-        // --- Command pool & buffers ---
-        let command_pool = device
-            .create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(graphics_family)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-            .context("command pool")?;
-
+        // --- Command buffers ---
         let command_buffers = device
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -227,6 +256,79 @@ impl Renderer {
                     .command_buffer_count(FRAMES_IN_FLIGHT as u32),
             )
             .context("command buffers")?;
+
+        // --- Per-frame UBO buffers ---
+        let ubo_size = std::mem::size_of::<FrameUniforms>() as vk::DeviceSize;
+        let mut ubo_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for _ in 0..FRAMES_IN_FLIGHT {
+            ubo_buffers.push(GpuBuffer::new(
+                &device,
+                &instance,
+                physical_device,
+                ubo_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?);
+        }
+
+        // --- Descriptor pool + sets ---
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: FRAMES_IN_FLIGHT as u32,
+        }];
+        let descriptor_pool = device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&pool_sizes)
+                    .max_sets(FRAMES_IN_FLIGHT as u32),
+                None,
+            )
+            .context("descriptor pool")?;
+
+        let layouts = vec![descriptor_set_layout; FRAMES_IN_FLIGHT];
+        let descriptor_sets = device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+            .context("descriptor sets")?;
+
+        for (i, &ds) in descriptor_sets.iter().enumerate() {
+            let buf_info = [vk::DescriptorBufferInfo {
+                buffer: ubo_buffers[i].buffer,
+                offset: 0,
+                range:  ubo_size,
+            }];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buf_info);
+            device.update_descriptor_sets(&[write], &[]);
+        }
+
+        // --- Hardcoded cube mesh ---
+        let (vertices, indices) = cube_mesh();
+        let vertex_buffer = upload_to_device_local(
+            &device,
+            &instance,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &vertices,
+        )?;
+        let index_buffer = upload_to_device_local(
+            &device,
+            &instance,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &indices,
+        )?;
+        let index_count = indices.len() as u32;
 
         // --- Sync ---
         let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
@@ -277,12 +379,22 @@ impl Renderer {
             swapchain_image_views,
             swapchain_format,
             swapchain_extent,
+            depth_image,
+            depth_image_memory,
+            depth_image_view,
             render_pass,
+            descriptor_set_layout,
             pipeline_layout,
             pipeline,
             framebuffers,
             command_pool,
             command_buffers,
+            ubo_buffers,
+            descriptor_pool,
+            descriptor_sets,
+            vertex_buffer,
+            index_buffer,
+            index_count,
             image_available,
             render_finished,
             in_flight,
@@ -301,7 +413,7 @@ impl Renderer {
         self.device
             .wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)?;
 
-        let (image_index, suboptimal) = match self.swapchain_loader.acquire_next_image(
+        let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
             u64::MAX,
             self.image_available[frame],
@@ -318,10 +430,13 @@ impl Renderer {
 
         self.device.reset_fences(&[self.in_flight[frame]])?;
 
+        // Update UBO
+        self.update_ubo(frame)?;
+
         let cmd = self.command_buffers[frame];
         self.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-        self.record_commands(cmd, image_index as usize)?;
+        self.record_commands(cmd, image_index as usize, frame)?;
 
         let wait_semaphores = [self.image_available[frame]];
         let signal_semaphores = [self.render_finished[frame]];
@@ -352,11 +467,6 @@ impl Renderer {
                 self.rebuild_swapchain(size.width, size.height)?;
             }
             Ok(false) => {}
-            Err(e) if suboptimal => {
-                let _ = e;
-                let size = self.window.inner_size();
-                self.rebuild_swapchain(size.width, size.height)?;
-            }
             Err(e) => return Err(e.into()),
         }
 
@@ -364,18 +474,58 @@ impl Renderer {
         Ok(())
     }
 
-    unsafe fn record_commands(&self, cmd: vk::CommandBuffer, image_index: usize) -> Result<()> {
+    unsafe fn update_ubo(&self, frame: usize) -> Result<()> {
+        let extent = self.swapchain_extent;
+        let aspect = extent.width as f32 / extent.height as f32;
+
+        let eye = Vec3::new(2.0, 2.0, 3.5);
+        let target = Vec3::ZERO;
+        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let proj = Mat4::perspective_rh(f32::to_radians(60.0), aspect, 0.01, 1000.0);
+        // Flip Y for Vulkan NDC
+        let proj = Mat4::from_cols(
+            proj.col(0),
+            -proj.col(1),
+            proj.col(2),
+            proj.col(3),
+        );
+
+        let uniforms = FrameUniforms {
+            view: view.to_cols_array_2d(),
+            projection: proj.to_cols_array_2d(),
+            camera_position: [eye.x, eye.y, eye.z, 1.0],
+            lights: [Default::default(); MAX_LIGHTS],
+            light_count: 0,
+            _pad: [0; 3],
+        };
+        self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))
+    }
+
+    unsafe fn record_commands(
+        &self,
+        cmd: vk::CommandBuffer,
+        image_index: usize,
+        frame: usize,
+    ) -> Result<()> {
         self.device.begin_command_buffer(
             cmd,
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
 
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.1, 0.1, 0.15, 1.0],
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.1, 0.1, 0.15, 1.0],
+                },
             },
-        }];
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
         let render_pass_begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass)
             .framebuffer(self.framebuffers[image_index])
@@ -385,11 +535,8 @@ impl Renderer {
             })
             .clear_values(&clear_values);
 
-        self.device.cmd_begin_render_pass(
-            cmd,
-            &render_pass_begin,
-            vk::SubpassContents::INLINE,
-        );
+        self.device
+            .cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
 
         self.device
             .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
@@ -403,14 +550,37 @@ impl Renderer {
             max_depth: 1.0,
         };
         self.device.cmd_set_viewport(cmd, 0, &[viewport]);
-
         let scissor = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: self.swapchain_extent,
         };
         self.device.cmd_set_scissor(cmd, 0, &[scissor]);
 
-        self.device.cmd_draw(cmd, 3, 1, 0, 0);
+        // Bind frame descriptor set
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline_layout,
+            0,
+            &[self.descriptor_sets[frame]],
+            &[],
+        );
+
+        // Push model matrix as push constant
+        let model = Mat4::IDENTITY;
+        let model_arr = model.to_cols_array_2d();
+        let model_bytes = bytemuck::bytes_of(&model_arr);
+        self.device.cmd_push_constants(
+            cmd,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            model_bytes,
+        );
+
+        self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.buffer], &[0]);
+        self.device.cmd_bind_index_buffer(cmd, self.index_buffer.buffer, 0, vk::IndexType::UINT32);
+        self.device.cmd_draw_indexed(cmd, self.index_count, 1, 0, 0, 0);
 
         self.device.cmd_end_render_pass(cmd);
         self.device.end_command_buffer(cmd)?;
@@ -427,17 +597,18 @@ impl Renderer {
         }
         self.device.device_wait_idle()?;
 
-        // Destroy old framebuffers and image views
         for fb in self.framebuffers.drain(..) {
             self.device.destroy_framebuffer(fb, None);
         }
         for iv in self.swapchain_image_views.drain(..) {
             self.device.destroy_image_view(iv, None);
         }
+        self.device.destroy_image_view(self.depth_image_view, None);
+        self.device.destroy_image(self.depth_image, None);
+        self.device.free_memory(self.depth_image_memory, None);
 
         let old_swapchain = self.swapchain;
         let (swapchain, images, image_views, format, extent) = create_swapchain(
-            &self.instance,
             &self.device,
             self.physical_device,
             &self.surface_loader,
@@ -456,10 +627,23 @@ impl Renderer {
         self.swapchain_format = format;
         self.swapchain_extent = extent;
 
+        let (di, dim, div) = create_depth_image(
+            &self.device,
+            &self.instance,
+            self.physical_device,
+            extent,
+            self.command_pool,
+            self.graphics_queue,
+        )?;
+        self.depth_image = di;
+        self.depth_image_memory = dim;
+        self.depth_image_view = div;
+
         self.framebuffers = create_framebuffers(
             &self.device,
             self.render_pass,
             &self.swapchain_image_views,
+            self.depth_image_view,
             self.swapchain_extent,
         )?;
 
@@ -478,22 +662,33 @@ impl Drop for Renderer {
                 self.device.destroy_fence(self.in_flight[i], None);
             }
 
+            self.vertex_buffer.destroy(&self.device);
+            self.index_buffer.destroy(&self.device);
+
+            for buf in &self.ubo_buffers {
+                buf.destroy(&self.device);
+            }
+            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+
             self.device.destroy_command_pool(self.command_pool, None);
 
             for fb in &self.framebuffers {
                 self.device.destroy_framebuffer(*fb, None);
             }
+            self.device.destroy_image_view(self.depth_image_view, None);
+            self.device.destroy_image(self.depth_image, None);
+            self.device.free_memory(self.depth_image_memory, None);
+
             for iv in &self.swapchain_image_views {
                 self.device.destroy_image_view(*iv, None);
             }
 
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
 
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
+            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
 
             #[cfg(debug_assertions)]
@@ -516,7 +711,7 @@ unsafe fn pick_physical_device(
     surface: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32, u32)> {
     let devices = instance.enumerate_physical_devices()?;
-    let mut best: Option<(vk::PhysicalDevice, u32, u32, u32)> = None; // (dev, gfx, present, score)
+    let mut best: Option<(vk::PhysicalDevice, u32, u32, u32)> = None;
 
     for dev in devices {
         let props = instance.get_physical_device_properties(dev);
@@ -537,7 +732,6 @@ unsafe fn pick_physical_device(
             }
         }
 
-        // Check swapchain extension
         let ext_props = instance.enumerate_device_extension_properties(dev)?;
         let has_swapchain = ext_props.iter().any(|e| {
             e.extension_name_as_c_str()
@@ -570,7 +764,6 @@ unsafe fn pick_physical_device(
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_swapchain(
-    _instance: &ash::Instance,
     device: &ash::Device,
     physical_device: vk::PhysicalDevice,
     surface_loader: &ash::khr::surface::Instance,
@@ -594,7 +787,6 @@ unsafe fn create_swapchain(
     let present_modes =
         surface_loader.get_physical_device_surface_present_modes(physical_device, surface)?;
 
-    // Pick format: prefer B8G8R8A8_SRGB / SRGB_NONLINEAR
     let format = formats
         .iter()
         .find(|f| {
@@ -605,14 +797,12 @@ unsafe fn create_swapchain(
         .copied()
         .context("no surface format")?;
 
-    // Pick present mode: prefer MAILBOX, fallback FIFO
     let present_mode = present_modes
         .iter()
         .find(|&&m| m == vk::PresentModeKHR::MAILBOX)
         .copied()
         .unwrap_or(vk::PresentModeKHR::FIFO);
 
-    // Extent
     let extent = if capabilities.current_extent.width != u32::MAX {
         capabilities.current_extent
     } else {
@@ -695,65 +885,196 @@ unsafe fn create_swapchain(
     Ok((swapchain, images, image_views, format.format, extent))
 }
 
+unsafe fn create_depth_image(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    extent: vk::Extent2D,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+    let format = vk::Format::D32_SFLOAT;
+    let image = device
+        .create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )
+        .context("create depth image")?;
+
+    let req = device.get_image_memory_requirements(image);
+    let mem_type = crate::vulkan::buffer::find_memory_type(
+        instance,
+        physical_device,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    let memory = device
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type),
+            None,
+        )
+        .context("depth image memory")?;
+    device.bind_image_memory(image, memory, 0)?;
+
+    // Transition to depth attachment layout
+    let cmd = crate::vulkan::buffer::begin_one_shot(device, command_pool)?;
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+    device.cmd_pipeline_barrier(
+        cmd,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &[barrier],
+    );
+    crate::vulkan::buffer::end_one_shot(device, command_pool, queue, cmd)?;
+
+    let view = device
+        .create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }),
+            None,
+        )
+        .context("depth image view")?;
+
+    Ok((image, memory, view))
+}
+
 unsafe fn create_render_pass(
     device: &ash::Device,
-    format: vk::Format,
+    color_format: vk::Format,
 ) -> Result<vk::RenderPass> {
-    let attachments = [vk::AttachmentDescription::default()
-        .format(format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+    let attachments = [
+        // Color
+        vk::AttachmentDescription::default()
+            .format(color_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+        // Depth
+        vk::AttachmentDescription::default()
+            .format(vk::Format::D32_SFLOAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+    ];
 
     let color_refs = [vk::AttachmentReference {
         attachment: 0,
         layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
     }];
+    let depth_ref = vk::AttachmentReference {
+        attachment: 1,
+        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
     let subpasses = [vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_refs)];
+        .color_attachments(&color_refs)
+        .depth_stencil_attachment(&depth_ref)];
 
     let dependencies = [vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
-        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
         .src_access_mask(vk::AccessFlags::empty())
-        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+        .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )];
 
-    let render_pass_info = vk::RenderPassCreateInfo::default()
-        .attachments(&attachments)
-        .subpasses(&subpasses)
-        .dependencies(&dependencies);
+    Ok(device.create_render_pass(
+        &vk::RenderPassCreateInfo::default()
+            .attachments(&attachments)
+            .subpasses(&subpasses)
+            .dependencies(&dependencies),
+        None,
+    )?)
+}
 
-    Ok(device.create_render_pass(&render_pass_info, None)?)
+unsafe fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
+
+    Ok(device.create_descriptor_set_layout(
+        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+        None,
+    )?)
 }
 
 unsafe fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    extent: vk::Extent2D,
+    _extent: vk::Extent2D,
+    descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
-    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/triangle.vert.spv"))
+    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.vert.spv"))
         .context("load vertex shader")?;
-    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/triangle.frag.spv"))
+    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.frag.spv"))
         .context("load fragment shader")?;
 
     let vert_module = device
-        .create_shader_module(
-            &vk::ShaderModuleCreateInfo::default().code(&vert_spv),
-            None,
-        )
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
         .context("vert shader module")?;
     let frag_module = device
-        .create_shader_module(
-            &vk::ShaderModuleCreateInfo::default().code(&frag_spv),
-            None,
-        )
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)
         .context("frag shader module")?;
 
     let entry_point = c"main";
@@ -768,27 +1089,38 @@ unsafe fn create_pipeline(
             .name(entry_point),
     ];
 
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let vertex_binding = vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(std::mem::size_of::<GpuVertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX);
+    let vertex_attrs = [
+        vk::VertexInputAttributeDescription {
+            location: 0, binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT, offset: 0,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 1, binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT, offset: 12,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 2, binding: 0,
+            format: vk::Format::R32G32_SFLOAT, offset: 24,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 3, binding: 0,
+            format: vk::Format::R32G32B32A32_SFLOAT, offset: 32,
+        },
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(std::slice::from_ref(&vertex_binding))
+        .vertex_attribute_descriptions(&vertex_attrs);
+
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
-    let viewport = vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: extent.width as f32,
-        height: extent.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    };
-    let scissor = vk::Rect2D {
-        offset: vk::Offset2D { x: 0, y: 0 },
-        extent,
-    };
-    let viewports = [viewport];
-    let scissors = [scissor];
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewports(&viewports)
-        .scissors(&scissors);
+        .viewport_count(1)
+        .scissor_count(1);
 
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
@@ -798,6 +1130,12 @@ unsafe fn create_pipeline(
 
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS)
+        .depth_bounds_test_enable(false);
 
     let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::RGBA);
@@ -809,8 +1147,18 @@ unsafe fn create_pipeline(
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
+    let set_layouts = [descriptor_set_layout];
+    let push_constant_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(64); // mat4
     let layout = device
-        .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+        .create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(std::slice::from_ref(&push_constant_range)),
+            None,
+        )
         .context("pipeline layout")?;
 
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
@@ -820,6 +1168,7 @@ unsafe fn create_pipeline(
         .viewport_state(&viewport_state)
         .rasterization_state(&rasterization)
         .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
         .color_blend_state(&color_blend)
         .dynamic_state(&dynamic_state)
         .layout(layout)
@@ -841,12 +1190,13 @@ unsafe fn create_framebuffers(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     image_views: &[vk::ImageView],
+    depth_view: vk::ImageView,
     extent: vk::Extent2D,
 ) -> Result<Vec<vk::Framebuffer>> {
     image_views
         .iter()
         .map(|&iv| {
-            let attachments = [iv];
+            let attachments = [iv, depth_view];
             device
                 .create_framebuffer(
                     &vk::FramebufferCreateInfo::default()
@@ -874,6 +1224,52 @@ pub fn load_spirv(path: &std::path::Path) -> Result<Vec<u32>> {
         .collect())
 }
 
+/// Hardcoded unit cube with per-face normals.
+fn cube_mesh() -> (Vec<GpuVertex>, Vec<u32>) {
+    // 6 faces × 4 vertices = 24 vertices
+    let faces: [([f32; 3], [f32; 3]); 6] = [
+        // (normal, +axis offset)
+        ([0.0, 0.0,  1.0], [0.0, 0.0,  1.0]), // front  +Z
+        ([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]), // back   -Z
+        ([1.0, 0.0,  0.0], [1.0, 0.0,  0.0]), // right  +X
+        ([-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]), // left   -X
+        ([0.0,  1.0, 0.0], [0.0,  1.0, 0.0]), // top    +Y
+        ([0.0, -1.0, 0.0], [0.0, -1.0, 0.0]), // bottom -Y
+    ];
+
+    // Local 2D corners (tangent / bitangent)
+    let corners: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+    let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+
+    for (face_idx, (normal, center)) in faces.iter().enumerate() {
+        let n = glam::Vec3::from(*normal);
+        // Choose tangent: for Y-faces use X, otherwise use Y
+        let up = if n.y.abs() > 0.9 { glam::Vec3::Z } else { glam::Vec3::Y };
+        let tangent = n.cross(up).normalize();
+        let bitangent = n.cross(tangent).normalize();
+
+        let base = face_idx as u32 * 4;
+        for (i, corner) in corners.iter().enumerate() {
+            let pos = glam::Vec3::from(*center)
+                + tangent * corner[0]
+                + bitangent * corner[1];
+            vertices.push(GpuVertex {
+                position: pos.to_array(),
+                normal: *normal,
+                uv: uvs[i],
+                tangent: [tangent.x, tangent.y, tangent.z, 1.0],
+            });
+        }
+        // Two CCW triangles per face
+        indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+    }
+
+    (vertices, indices)
+}
+
 #[cfg(debug_assertions)]
 unsafe extern "system" fn vulkan_debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -893,4 +1289,3 @@ unsafe extern "system" fn vulkan_debug_callback(
     }
     vk::FALSE
 }
-
