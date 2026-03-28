@@ -1,0 +1,3 @@
+/target/
+shaders/compiled/
+pipeline_cache.bin
