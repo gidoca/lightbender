@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ash::vk;
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 use winit::window::Window;
 
+use crate::camera::Camera;
 use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 
@@ -403,11 +404,11 @@ impl Renderer {
         })
     }
 
-    pub fn draw_frame(&mut self) -> Result<()> {
-        unsafe { self.draw_frame_inner() }
+    pub fn draw_frame(&mut self, camera: &Camera) -> Result<()> {
+        unsafe { self.draw_frame_inner(camera) }
     }
 
-    unsafe fn draw_frame_inner(&mut self) -> Result<()> {
+    unsafe fn draw_frame_inner(&mut self, camera: &Camera) -> Result<()> {
         let frame = self.current_frame;
 
         self.device
@@ -431,7 +432,7 @@ impl Renderer {
         self.device.reset_fences(&[self.in_flight[frame]])?;
 
         // Update UBO
-        self.update_ubo(frame)?;
+        self.update_ubo(frame, camera)?;
 
         let cmd = self.command_buffers[frame];
         self.device
@@ -474,21 +475,13 @@ impl Renderer {
         Ok(())
     }
 
-    unsafe fn update_ubo(&self, frame: usize) -> Result<()> {
+    unsafe fn update_ubo(&self, frame: usize, camera: &Camera) -> Result<()> {
         let extent = self.swapchain_extent;
         let aspect = extent.width as f32 / extent.height as f32;
 
-        let eye = Vec3::new(2.0, 2.0, 3.5);
-        let target = Vec3::ZERO;
-        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
-        let proj = Mat4::perspective_rh(f32::to_radians(60.0), aspect, 0.01, 1000.0);
-        // Flip Y for Vulkan NDC
-        let proj = Mat4::from_cols(
-            proj.col(0),
-            -proj.col(1),
-            proj.col(2),
-            proj.col(3),
-        );
+        let view = camera.view_matrix();
+        let proj = camera.projection_matrix(aspect);
+        let eye  = camera.position;
 
         let uniforms = FrameUniforms {
             view: view.to_cols_array_2d(),

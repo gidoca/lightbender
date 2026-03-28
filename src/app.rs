@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use glam::Vec3;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{DeviceEvent, DeviceId, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::ActiveEventLoop,
     window::{Window, WindowId},
 };
 
+use crate::camera::OrbitalCamera;
+use crate::input::InputState;
 use crate::renderer::Renderer;
 
 pub struct App {
@@ -15,8 +18,10 @@ pub struct App {
 }
 
 struct AppState {
-    window: Arc<Window>,
+    window:   Arc<Window>,
     renderer: Renderer,
+    camera:   OrbitalCamera,
+    input:    InputState,
 }
 
 impl App {
@@ -33,7 +38,9 @@ impl App {
             )?,
         );
         let renderer = Renderer::new(window.clone())?;
-        self.state = Some(AppState { window, renderer });
+        let camera   = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
+        let input    = InputState::default();
+        self.state = Some(AppState { window, renderer, camera, input });
         Ok(())
     }
 }
@@ -48,15 +55,25 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        let Some(state) = self.state.as_mut() else { return };
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            state.input.accumulate_mouse_delta(dx, dy);
+        }
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
+        let Some(state) = self.state.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -73,8 +90,27 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::MouseInput { button, state: btn_state, .. } => {
+                let pressed = btn_state == winit::event::ElementState::Pressed;
+                match button {
+                    MouseButton::Left   => state.input.left_button   = pressed,
+                    MouseButton::Right  => state.input.right_button  = pressed,
+                    MouseButton::Middle => state.input.middle_button = pressed,
+                    _ => {}
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y)   => y,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 50.0,
+                };
+                state.input.accumulate_scroll(scroll);
+            }
             WindowEvent::RedrawRequested => {
-                match state.renderer.draw_frame() {
+                state.camera.update(&state.input);
+                state.input.flush();
+
+                match state.renderer.draw_frame(&state.camera.camera) {
                     Ok(_) => {}
                     Err(e) => {
                         log::error!("draw_frame failed: {e:#}");

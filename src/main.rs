@@ -1,4 +1,6 @@
 mod app;
+mod camera;
+mod input;
 mod renderer;
 mod types;
 mod vulkan;
