@@ -1293,7 +1293,7 @@ impl Renderer {
     /// Build and register a named pipeline from an already-loaded shader pair.
     pub fn add_pipeline(&mut self, name: &str, pair: &ShaderPair) -> Result<()> {
         unsafe {
-            let (_, pipeline) = create_pipeline(
+            let (extra_layout, pipeline) = create_pipeline(
                 &self.device,
                 self.render_pass,
                 self.descriptor_set_layout,
@@ -1302,6 +1302,8 @@ impl Renderer {
                 self.pipeline_cache,
                 Some(pair),
             )?;
+            // create_pipeline always creates a new layout, but we reuse self.pipeline_layout
+            self.device.destroy_pipeline_layout(extra_layout, None);
             if let Some(old) = self.pipelines.insert(name.to_string(), pipeline) {
                 self.device.destroy_pipeline(old, None);
             }
