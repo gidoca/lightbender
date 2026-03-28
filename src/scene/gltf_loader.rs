@@ -164,20 +164,6 @@ unsafe fn load_inner(
         )?[0])
     };
 
-    // Helper: write a combined image sampler binding
-    let write_sampler = |ds: vk::DescriptorSet,
-                         binding: u32,
-                         view: vk::ImageView,
-                         sampler: vk::Sampler|
-     -> vk::WriteDescriptorSet {
-        // We build a temporary struct; the caller must keep image_info alive.
-        vk::WriteDescriptorSet::default()
-            .dst_set(ds)
-            .dst_binding(binding)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-    };
-    let _ = write_sampler; // suppress unused warning; we build writes below manually
-
     for material in document.materials() {
         let pbr = material.pbr_metallic_roughness();
 

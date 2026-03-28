@@ -13,6 +13,7 @@ use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 
 const FRAMES_IN_FLIGHT: usize = 2;
+const PIPELINE_CACHE_FILE: &str = "pipeline_cache.bin";
 
 pub struct Renderer {
     _entry: ash::Entry,
@@ -51,6 +52,7 @@ pub struct Renderer {
     /// Set 1: per-material textures (5× combined image samplers)
     pub material_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
+    pipeline_cache: vk::PipelineCache,
     /// "default" pipeline + any user-loaded named pipelines
     pipelines: HashMap<String, vk::Pipeline>,
 
@@ -244,9 +246,21 @@ impl Renderer {
         // --- Descriptor set layout (set 1: material textures) ---
         let material_set_layout = create_material_set_layout(&device)?;
 
+        // --- Pipeline cache (load from disk if available) ---
+        let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
+        let pipeline_cache = device.create_pipeline_cache(
+            &vk::PipelineCacheCreateInfo::default().initial_data(&cache_data),
+            None,
+        ).context("pipeline cache")?;
+        if cache_data.is_empty() {
+            log::debug!("Pipeline cache cold (no file on disk)");
+        } else {
+            log::debug!("Pipeline cache loaded from {PIPELINE_CACHE_FILE} ({} bytes)", cache_data.len());
+        }
+
         // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, None)
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, pipeline_cache, None)
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
@@ -399,6 +413,7 @@ impl Renderer {
             descriptor_set_layout,
             material_set_layout,
             pipeline_layout,
+            pipeline_cache,
             pipelines,
             framebuffers,
             command_pool,
@@ -427,7 +442,12 @@ impl Renderer {
         self.device
             .wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)?;
 
-        let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(()); // minimized — nothing to draw
+        }
+
+        let (image_index, suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
             u64::MAX,
             self.image_available[frame],
@@ -435,12 +455,14 @@ impl Renderer {
         ) {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                let size = self.window.inner_size();
                 self.rebuild_swapchain(size.width, size.height)?;
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
         };
+        if suboptimal {
+            // Swapchain still usable; rebuild after presenting this frame
+        }
 
         self.device.reset_fences(&[self.in_flight[frame]])?;
 
@@ -472,19 +494,24 @@ impl Renderer {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        match self
+        let present_result = self
             .swapchain_loader
-            .queue_present(self.present_queue, &present_info)
-        {
-            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                let size = self.window.inner_size();
-                self.rebuild_swapchain(size.width, size.height)?;
-            }
-            Ok(false) => {}
-            Err(e) => return Err(e.into()),
-        }
+            .queue_present(self.present_queue, &present_info);
 
         self.current_frame = (self.current_frame + 1) % FRAMES_IN_FLIGHT;
+
+        match present_result {
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                let sz = self.window.inner_size();
+                self.rebuild_swapchain(sz.width, sz.height)?;
+            }
+            Ok(false) if suboptimal => {
+                let sz = self.window.inner_size();
+                self.rebuild_swapchain(sz.width, sz.height)?;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
 
@@ -640,6 +667,7 @@ impl Renderer {
                 self.render_pass,
                 self.descriptor_set_layout,
                 self.material_set_layout,
+                self.pipeline_cache,
                 Some(pair),
             )?;
             if let Some(old) = self.pipelines.insert(name.to_string(), pipeline) {
@@ -771,6 +799,20 @@ impl Drop for Renderer {
                 self.device.destroy_pipeline(*pipeline, None);
             }
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+
+            // Save pipeline cache to disk for faster startup next time
+            match self.device.get_pipeline_cache_data(self.pipeline_cache) {
+                Ok(data) => {
+                    if let Err(e) = std::fs::write(PIPELINE_CACHE_FILE, &data) {
+                        log::warn!("Failed to save pipeline cache: {e}");
+                    } else {
+                        log::debug!("Pipeline cache saved ({} bytes)", data.len());
+                    }
+                }
+                Err(e) => log::warn!("Failed to get pipeline cache data: {e}"),
+            }
+            self.device.destroy_pipeline_cache(self.pipeline_cache, None);
+
             self.device.destroy_render_pass(self.render_pass, None);
 
             self.swapchain_loader.destroy_swapchain(self.swapchain, None);
@@ -1166,6 +1208,7 @@ unsafe fn create_pipeline(
     render_pass: vk::RenderPass,
     descriptor_set_layout: vk::DescriptorSetLayout,
     material_set_layout: vk::DescriptorSetLayout,
+    pipeline_cache: vk::PipelineCache,
     // Pre-loaded shader modules to use. If None, loads the built-in mesh shaders.
     shader_pair: Option<&ShaderPair>,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
@@ -1285,7 +1328,7 @@ unsafe fn create_pipeline(
         .subpass(0);
 
     let pipelines = device
-        .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        .create_graphics_pipelines(pipeline_cache, &[pipeline_info], None)
         .map_err(|(_, e)| e)
         .context("graphics pipeline")?;
 

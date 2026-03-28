@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use glam::{Quat, Vec3};
 use serde::Deserialize;
 
-use super::{gltf_loader, Scene, SceneNode, Transform};
+use super::{gltf_loader, Scene, Transform};
 use crate::renderer::Renderer;
 
 // ── JSON schema ───────────────────────────────────────────────────────────────
