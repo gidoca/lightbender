@@ -90,6 +90,7 @@ pub struct Renderer {
     current_frame: usize,
     /// Tracks which image_available semaphore to pass to acquire_next_image
     next_semaphore: usize,
+    last_image_index: usize,
 
     window: Arc<Window>,
 }
@@ -557,6 +558,7 @@ impl Renderer {
             in_flight,
             current_frame: 0,
             next_semaphore: 0,
+            last_image_index: 0,
             window,
         })
     }
@@ -597,6 +599,7 @@ impl Renderer {
         }
 
         self.device.reset_fences(&[self.in_flight[frame]])?;
+        self.last_image_index = image_index as usize;
 
         // Update UBO
         self.update_ubo(frame, camera)?;
@@ -879,6 +882,149 @@ impl Renderer {
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         unsafe { self.rebuild_swapchain(width, height) }
+    }
+
+    /// Copy the most recently rendered swapchain image to a file.
+    pub fn capture_frame_to_file(&self, path: &std::path::Path) -> Result<()> {
+        unsafe { self.capture_frame_to_file_inner(path) }
+    }
+
+    unsafe fn capture_frame_to_file_inner(&self, path: &std::path::Path) -> Result<()> {
+        use crate::vulkan::buffer::{begin_one_shot, end_one_shot, find_memory_type};
+
+        self.device.device_wait_idle()?;
+
+        let width = self.swapchain_extent.width;
+        let height = self.swapchain_extent.height;
+        let image_size = (width * height * 4) as vk::DeviceSize;
+
+        // Create host-visible staging buffer
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(image_size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = self.device.create_buffer(&buffer_info, None)
+            .context("create staging buffer")?;
+
+        let mem_reqs = self.device.get_buffer_memory_requirements(buffer);
+        let mem_type = find_memory_type(
+            &self.instance,
+            self.physical_device,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ).context("find host-visible memory type")?;
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type);
+        let buffer_memory = self.device.allocate_memory(&alloc_info, None)
+            .context("allocate staging memory")?;
+        self.device.bind_buffer_memory(buffer, buffer_memory, 0)?;
+
+        // Record copy commands
+        let src_image = self.swapchain_images[self.last_image_index];
+        let cmd = begin_one_shot(&self.device, self.command_pool)?;
+
+        // Transition swapchain image to TRANSFER_SRC
+        let barrier_to_src = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[], &[],
+            &[barrier_to_src],
+        );
+
+        // Copy image to buffer
+        let region = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D { width, height, depth: 1 },
+        };
+        self.device.cmd_copy_image_to_buffer(
+            cmd,
+            src_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer,
+            &[region],
+        );
+
+        // Transition swapchain image back to PRESENT_SRC
+        let barrier_back = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[], &[],
+            &[barrier_back],
+        );
+
+        end_one_shot(&self.device, self.command_pool, self.graphics_queue, cmd)?;
+
+        // Read pixels from staging buffer
+        let data_ptr = self.device.map_memory(buffer_memory, 0, image_size, vk::MemoryMapFlags::empty())
+            .context("map staging buffer")?;
+        let mut pixels = vec![0u8; image_size as usize];
+        std::ptr::copy_nonoverlapping(data_ptr as *const u8, pixels.as_mut_ptr(), pixels.len());
+        self.device.unmap_memory(buffer_memory);
+
+        // Swap B and R channels if swapchain format is BGRA
+        let is_bgra = matches!(
+            self.swapchain_format,
+            vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM
+        );
+        if is_bgra {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+
+        // Clean up staging buffer
+        self.device.destroy_buffer(buffer, None);
+        self.device.free_memory(buffer_memory, None);
+
+        // Save image
+        image::save_buffer(path, &pixels, width, height, image::ColorType::Rgba8)
+            .context("save image file")?;
+
+        Ok(())
     }
 
     unsafe fn rebuild_swapchain(&mut self, width: u32, height: u32) -> Result<()> {
@@ -1189,7 +1335,7 @@ unsafe fn create_swapchain(
         .image_color_space(format.color_space)
         .image_extent(extent)
         .image_array_layers(1)
-        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
         .image_sharing_mode(sharing_mode)
         .queue_family_indices(queue_family_indices)
         .pre_transform(capabilities.current_transform)
