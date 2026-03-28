@@ -24,6 +24,7 @@ pub enum InputPath {
 
 pub struct App {
     pub input_path: Option<InputPath>,
+    pub output_path: Option<PathBuf>,
     state: Option<AppState>,
 }
 
@@ -48,8 +49,8 @@ impl Drop for AppState {
 }
 
 impl App {
-    pub fn new(input_path: Option<InputPath>) -> Self {
-        Self { input_path, state: None }
+    pub fn new(input_path: Option<InputPath>, output_path: Option<PathBuf>) -> Self {
+        Self { input_path, output_path, state: None }
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -218,8 +219,19 @@ impl ApplicationHandler for App {
                     Err(e) => {
                         log::error!("draw_frame failed: {e:#}");
                         event_loop.exit();
+                        return;
                     }
                 }
+
+                if let Some(path) = &self.output_path {
+                    match state.renderer.capture_frame_to_file(path) {
+                        Ok(()) => log::info!("Saved output to {}", path.display()),
+                        Err(e) => log::error!("Failed to save output: {e:#}"),
+                    }
+                    event_loop.exit();
+                    return;
+                }
+
                 state.window.request_redraw();
             }
             _ => {}
