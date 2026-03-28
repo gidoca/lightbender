@@ -13,11 +13,15 @@ use winit::{
 use crate::camera::OrbitalCamera;
 use crate::input::InputState;
 use crate::renderer::Renderer;
-use crate::scene::{gltf_loader, Scene};
+use crate::scene::{gltf_loader, loader, Scene};
+
+pub enum InputPath {
+    Model(PathBuf),
+    Scene(PathBuf),
+}
 
 pub struct App {
-    /// Optional path to a GLB/glTF file to load at startup.
-    pub model_path: Option<PathBuf>,
+    pub input_path: Option<InputPath>,
     state: Option<AppState>,
 }
 
@@ -32,7 +36,6 @@ struct AppState {
 
 impl Drop for AppState {
     fn drop(&mut self) {
-        // Wait for GPU to be idle before destroying scene resources
         if let Some(scene) = self.scene.take() {
             unsafe {
                 let _ = self.renderer.device_wait_idle();
@@ -43,8 +46,8 @@ impl Drop for AppState {
 }
 
 impl App {
-    pub fn new(model_path: Option<PathBuf>) -> Self {
-        Self { model_path, state: None }
+    pub fn new(input_path: Option<InputPath>) -> Self {
+        Self { input_path, state: None }
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -57,24 +60,40 @@ impl App {
         );
         let renderer = Renderer::new(window.clone())?;
 
-        let scene = if let Some(path) = &self.model_path {
-            let ctx = renderer.load_context();
-            match gltf_loader::load(&ctx, path) {
-                Ok(s) => {
-                    log::info!("Loaded model: {}", path.display());
-                    Some(s)
-                }
-                Err(e) => {
-                    log::error!("Failed to load model: {e:#}");
-                    None
+        let mut camera = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
+
+        let scene = match &self.input_path {
+            Some(InputPath::Model(path)) => {
+                let ctx = renderer.load_context();
+                match gltf_loader::load(&ctx, path) {
+                    Ok(s) => { log::info!("Loaded: {}", path.display()); Some(s) }
+                    Err(e) => { log::error!("Failed to load model: {e:#}"); None }
                 }
             }
-        } else {
-            None
+            Some(InputPath::Scene(path)) => {
+                match loader::load_scene(&renderer, path) {
+                    Ok(loaded) => {
+                        // Apply camera from scene description
+                        let cd = &loaded.description.camera;
+                        camera = OrbitalCamera::new(
+                            Vec3::from(cd.target),
+                            cd.distance,
+                            cd.yaw,
+                            cd.pitch,
+                        );
+                        camera.camera.fov_y = f32::to_radians(cd.fov_y);
+                        camera.camera.near  = cd.near;
+                        camera.camera.far   = cd.far;
+                        log::info!("Loaded scene: {}", path.display());
+                        Some(loaded.scene)
+                    }
+                    Err(e) => { log::error!("Failed to load scene: {e:#}"); None }
+                }
+            }
+            None => None,
         };
 
-        let camera = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
-        let input  = InputState::default();
+        let input = InputState::default();
         self.state = Some(AppState { window, scene, renderer, camera, input });
         Ok(())
     }
@@ -136,8 +155,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y)   => y,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 50.0,
+                    MouseScrollDelta::LineDelta(_, y)  => y,
+                    MouseScrollDelta::PixelDelta(pos)  => pos.y as f32 / 50.0,
                 };
                 state.input.accumulate_scroll(scroll);
             }

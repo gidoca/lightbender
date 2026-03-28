@@ -1,4 +1,5 @@
 pub mod gltf_loader;
+pub mod loader;
 
 use ash::vk;
 use glam::{Mat4, Quat, Vec3};
