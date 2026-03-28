@@ -13,6 +13,56 @@ fn reference_dir() -> PathBuf {
     project_root().join("tests").join("reference")
 }
 
+/// Find the Vulkan SDK setup-env.sh and return env vars to enable validation layers.
+fn vulkan_sdk_env() -> Vec<(String, String)> {
+    // Check if validation layer is already available
+    if std::env::var("VK_LAYER_PATH").is_ok() {
+        return vec![];
+    }
+
+    // Look for Vulkan SDK in common locations
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{home}/Downloads/VulkanSDK"),
+        format!("{home}/VulkanSDK"),
+        "/opt/VulkanSDK".to_string(),
+    ];
+
+    for base in &candidates {
+        let base_path = Path::new(base);
+        if !base_path.exists() {
+            continue;
+        }
+        // Find the newest version directory
+        let Ok(entries) = std::fs::read_dir(base_path) else {
+            continue;
+        };
+        let mut versions: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        versions.sort();
+        if let Some(version_dir) = versions.last() {
+            let layer_path = version_dir.join("share/vulkan/explicit_layer.d");
+            let lib_path = version_dir.join("lib");
+            if layer_path.exists() {
+                return vec![
+                    ("VK_LAYER_PATH".to_string(), layer_path.to_string_lossy().to_string()),
+                    ("LD_LIBRARY_PATH".to_string(), format!(
+                        "{}:{}",
+                        lib_path.display(),
+                        std::env::var("LD_LIBRARY_PATH").unwrap_or_default()
+                    )),
+                ];
+            }
+        }
+    }
+
+    eprintln!("Warning: Vulkan SDK not found — validation layer checks may not work");
+    vec![]
+}
+
 struct RenderResult {
     output_path: PathBuf,
     stderr: String,
@@ -30,13 +80,17 @@ fn render_scene(scene: &str) -> Option<RenderResult> {
     let _ = std::fs::create_dir_all(&output_dir);
     let output_path = output_dir.join(format!("{scene}.png"));
 
-    let output = Command::new(binary_path())
-        .arg(scene_path.as_os_str())
+    let mut cmd = Command::new(binary_path());
+    cmd.arg(scene_path.as_os_str())
         .arg("-o")
         .arg(output_path.as_os_str())
-        .env("RUST_LOG", "warn")
-        .output()
-        .expect("failed to execute lightbender binary");
+        .env("RUST_LOG", "warn");
+
+    for (key, value) in vulkan_sdk_env() {
+        cmd.env(key, value);
+    }
+
+    let output = cmd.output().expect("failed to execute lightbender binary");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
