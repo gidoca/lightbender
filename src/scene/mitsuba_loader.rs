@@ -900,6 +900,7 @@ struct MitsubaMaterial {
     conductor_material:   Option<String>, // e.g. "Au", "Cu", "Ag"
     eta:                  Option<Vec3>,   // complex IOR (real part)
     k:                    Option<Vec3>,   // complex IOR (imaginary part)
+    blend_weight:         Option<f32>,   // for blendbsdf
 }
 
 impl Default for MitsubaMaterial {
@@ -918,6 +919,7 @@ impl Default for MitsubaMaterial {
             conductor_material:   None,
             eta:                  None,
             k:                    None,
+            blend_weight:         None,
         }
     }
 }
@@ -927,7 +929,7 @@ impl Default for MitsubaMaterial {
 fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMaterial> {
     let mut mat = MitsubaMaterial::default();
     let mut buf = Vec::new();
-    let mut inner_bsdf: Option<MitsubaMaterial> = None;
+    let mut inner_bsdfs: Vec<MitsubaMaterial> = Vec::new();
     let mut skip_buf = Vec::new();
 
     loop {
@@ -941,7 +943,7 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
                 match tag.as_str() {
                     "bsdf" => {
                         let inner_type = attr_str(e, "type").unwrap_or_default();
-                        inner_bsdf = Some(parse_bsdf(reader, &inner_type)?);
+                        inner_bsdfs.push(parse_bsdf(reader, &inner_type)?);
                     }
                     "texture" => {
                         let tex_type = attr_str(e, "type").unwrap_or_default();
@@ -976,16 +978,48 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
     // Apply BSDF-type-specific mapping
     apply_bsdf_type_mapping(&mut mat, bsdf_type);
 
-    // Handle twosided: inherit from inner BSDF
-    if bsdf_type == "twosided" {
-        if let Some(inner) = inner_bsdf {
-            mat.base_color = inner.base_color;
-            mat.metallic = inner.metallic;
-            mat.roughness = inner.roughness;
-            mat.emissive = inner.emissive;
-            mat.base_color_texture = inner.base_color_texture;
+    // Handle composite BSDF types that depend on inner BSDFs
+    match bsdf_type {
+        "twosided" => {
+            if let Some(inner) = inner_bsdfs.into_iter().next() {
+                mat.base_color = inner.base_color;
+                mat.alpha = inner.alpha;
+                mat.metallic = inner.metallic;
+                mat.roughness = inner.roughness;
+                mat.emissive = inner.emissive;
+                mat.base_color_texture = inner.base_color_texture;
+            }
+            mat.double_sided = true;
         }
-        mat.double_sided = true;
+        "blendbsdf" => {
+            let w = mat.blend_weight.unwrap_or(0.5);
+            let mut iter = inner_bsdfs.into_iter();
+            if let (Some(a), Some(b)) = (iter.next(), iter.next()) {
+                mat.base_color = a.base_color * (1.0 - w) + b.base_color * w;
+                mat.alpha = a.alpha * (1.0 - w) + b.alpha * w;
+                mat.metallic = a.metallic * (1.0 - w) + b.metallic * w;
+                mat.roughness = a.roughness * (1.0 - w) + b.roughness * w;
+                mat.emissive = a.emissive * (1.0 - w) + b.emissive * w;
+                mat.double_sided = a.double_sided || b.double_sided;
+                mat.base_color_texture = a.base_color_texture.or(b.base_color_texture);
+            }
+        }
+        "mask" => {
+            // Opacity mask: inner BSDF provides surface properties, opacity from 'opacity' property
+            if let Some(inner) = inner_bsdfs.into_iter().next() {
+                mat.base_color = inner.base_color;
+                mat.metallic = inner.metallic;
+                mat.roughness = inner.roughness;
+                mat.emissive = inner.emissive;
+                mat.base_color_texture = inner.base_color_texture;
+                mat.double_sided = inner.double_sided;
+            }
+            // mat.alpha is already set from 'opacity' float property (handled below)
+        }
+        "null" => {
+            mat.alpha = 0.0;
+        }
+        _ => {}
     }
 
     Ok(mat)
@@ -1018,15 +1052,17 @@ fn handle_bsdf_property(e: &quick_xml::events::BytesStart, tag: &str, mat: &mut 
                     "alpha" => mat.roughness = v,
                     "int_ior" => mat.int_ior = Some(v),
                     "ext_ior" => mat.ext_ior = Some(v),
+                    "opacity" => mat.alpha = v,
+                    "weight" => mat.blend_weight = Some(v),
                     _ => {}
                 }
             }
         }
         "string" => {
-            if let Some(v) = attr_str(e, "value") {
-                if name == "material" {
-                    mat.conductor_material = Some(v);
-                }
+            if let Some(v) = attr_str(e, "value")
+                && name == "material"
+            {
+                mat.conductor_material = Some(v);
             }
         }
         _ => {}
@@ -1052,7 +1088,7 @@ fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
             // For plastics, the specular reflectance modulates the Fresnel
             if let Some(spec) = mat.specular_reflectance {
                 // Scale base color to account for energy conservation
-                mat.base_color = mat.base_color * (1.0 - spec.x.max(spec.y).max(spec.z) * f0_scalar);
+                mat.base_color *= 1.0 - spec.x.max(spec.y).max(spec.z) * f0_scalar;
             }
             let _ = f0_scalar; // F0 used implicitly via metallic=0 + dielectric fresnel in shader
         }
@@ -1097,15 +1133,14 @@ fn conductor_f0(mat: &MitsubaMaterial) -> Vec3 {
     }
 
     // If a named material is given, look up from table
-    if let Some(ref name) = mat.conductor_material {
-        if let Some(f0) = conductor_f0_table(name) {
-            // Apply specular_reflectance as a tint if provided
-            return if let Some(spec) = mat.specular_reflectance {
-                f0 * spec
-            } else {
-                f0
-            };
-        }
+    if let Some(ref name) = mat.conductor_material
+        && let Some(f0) = conductor_f0_table(name)
+    {
+        return if let Some(spec) = mat.specular_reflectance {
+            f0 * spec
+        } else {
+            f0
+        };
     }
 
     // If specular_reflectance is given, use directly
