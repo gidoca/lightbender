@@ -11,7 +11,7 @@ use winit::window::Window;
 use crate::camera::Camera;
 use crate::scene::{gltf_loader::LoadContext, GpuTexture, Scene};
 use crate::shader::ShaderPair;
-use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
+use crate::types::{FrameUniforms, GpuLight, GpuVertex, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 use crate::vulkan::image::GpuImage;
 
@@ -93,6 +93,9 @@ pub struct Renderer {
     ubo_buffers: Vec<GpuBuffer>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
+
+    // Scene lights
+    lights: Vec<GpuLight>,
 
     // Environment map
     env_intensity: f32,
@@ -573,6 +576,7 @@ impl Renderer {
             ubo_buffers,
             descriptor_pool,
             descriptor_sets,
+            lights: Vec::new(),
             env_intensity: 1.0,
             env_texture: None,
             env_fallback_texture,
@@ -987,6 +991,7 @@ impl Renderer {
             ubo_buffers,
             descriptor_pool,
             descriptor_sets,
+            lights: Vec::new(),
             env_intensity: 1.0,
             env_texture: None,
             env_fallback_texture,
@@ -1147,12 +1152,18 @@ impl Renderer {
         let proj = camera.projection_matrix(aspect);
         let eye  = camera.position;
 
+        let mut lights_arr = [GpuLight::default(); MAX_LIGHTS];
+        let count = self.lights.len().min(MAX_LIGHTS);
+        for (i, light) in self.lights.iter().take(count).enumerate() {
+            lights_arr[i] = *light;
+        }
+
         let uniforms = FrameUniforms {
             view: view.to_cols_array_2d(),
             projection: proj.to_cols_array_2d(),
             camera_position: [eye.x, eye.y, eye.z, 1.0],
-            lights: [Default::default(); MAX_LIGHTS],
-            light_count: 0,
+            lights: lights_arr,
+            light_count: count as u32,
             env_intensity: self.env_intensity,
             _pad: [0; 2],
         };
@@ -1342,6 +1353,10 @@ impl Renderer {
     }
 
     /// Set the environment map texture and IBL intensity. Updates all env descriptor sets.
+    pub fn set_lights(&mut self, lights: Vec<GpuLight>) {
+        self.lights = lights;
+    }
+
     pub fn set_environment_map(&mut self, texture: GpuTexture, intensity: f32) -> Result<()> {
         self.env_intensity = intensity;
         unsafe {

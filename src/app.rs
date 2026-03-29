@@ -15,6 +15,7 @@ use crate::input::InputState;
 use crate::renderer::Renderer;
 use crate::scene::{gltf_loader, loader, mitsuba_loader, GpuTexture, Scene};
 use crate::shader::ShaderLibrary;
+use crate::types::GpuLight;
 use crate::vulkan::image::{load_hdr_to_rgba32f, GpuImage};
 
 pub enum InputPath {
@@ -148,6 +149,43 @@ pub fn load_scene_from_input(
                         }
                     }
 
+                    // Convert JSON lights to GPU lights
+                    let gpu_lights: Vec<GpuLight> = loaded.description.lights.iter().map(|l| {
+                        match l {
+                            loader::LightDesc::Directional { direction, color, intensity, .. } => {
+                                GpuLight {
+                                    position_or_direction: [direction[0], direction[1], direction[2], 0.0],
+                                    color: *color,
+                                    intensity: *intensity,
+                                    ..Default::default()
+                                }
+                            }
+                            loader::LightDesc::Point { position, color, intensity, range, .. } => {
+                                GpuLight {
+                                    position_or_direction: [position[0], position[1], position[2], 1.0],
+                                    color: *color,
+                                    intensity: *intensity,
+                                    range: *range,
+                                    ..Default::default()
+                                }
+                            }
+                            loader::LightDesc::Spot { position, color, intensity, range, inner_cone_angle, outer_cone_angle, .. } => {
+                                GpuLight {
+                                    position_or_direction: [position[0], position[1], position[2], 2.0],
+                                    color: *color,
+                                    intensity: *intensity,
+                                    range: *range,
+                                    spot_angles: [inner_cone_angle.to_radians().cos(), outer_cone_angle.to_radians().cos()],
+                                    ..Default::default()
+                                }
+                            }
+                        }
+                    }).collect();
+                    if !gpu_lights.is_empty() {
+                        log::info!("Setting {} scene lights", gpu_lights.len());
+                        renderer.set_lights(gpu_lights);
+                    }
+
                     log::info!("Loaded scene: {}", path.display());
                     Some(loaded.scene)
                 }
@@ -174,10 +212,13 @@ pub fn load_scene_from_input(
                         }
                     }
 
-                    log::info!(
-                        "Loaded Mitsuba scene: {} ({} lights)",
-                        path.display(), loaded.lights.len(),
-                    );
+                    // Set scene lights
+                    if !loaded.lights.is_empty() {
+                        log::info!("Setting {} scene lights", loaded.lights.len());
+                        renderer.set_lights(loaded.lights);
+                    }
+
+                    log::info!("Loaded Mitsuba scene: {}", path.display());
                     Some(loaded.scene)
                 }
                 Err(e) => { log::error!("Failed to load Mitsuba scene: {e:#}"); None }

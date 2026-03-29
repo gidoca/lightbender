@@ -93,18 +93,63 @@ void main() {
     // Reflectance at normal incidence (F0)
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
-    // Hardcoded directional light (sun) — will be replaced by UBO lights later
-    vec3 lightDir   = normalize(vec3(1.0, 2.0, 1.5));
-    vec3 lightColor = vec3(3.0, 2.85, 2.55);
-
-    // Radiance contribution from one directional light
+    // Accumulate radiance from all scene lights
+    float NdotV = max(dot(N, V), 0.001);
     vec3 Lo = vec3(0.0);
-    {
-        vec3 L = lightDir;
-        vec3 H = normalize(V + L);
 
+    // Fallback: if no lights are defined, use a default sun
+    uint numLights = frame.lightCount;
+    if (numLights == 0u) {
+        // Default directional light (warm sunlight)
+        vec3 L = normalize(vec3(1.0, 2.0, 1.5));
+        vec3 H = normalize(V + L);
         float NdotL = max(dot(N, L), 0.0);
-        float NdotV = max(dot(N, V), 0.0);
+        float NdotH = max(dot(N, H), 0.0);
+        float HdotV = max(dot(H, V), 0.0);
+        float D = distributionGGX(NdotH, roughness);
+        float G = geometrySmith(NdotV, NdotL, roughness);
+        vec3  F = fresnelSchlick(HdotV, F0);
+        vec3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
+        vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+        Lo += (kD * albedo / PI + specular) * vec3(3.0, 2.85, 2.55) * NdotL;
+    }
+
+    for (uint i = 0u; i < numLights; i++) {
+        GpuLight light = frame.lights[i];
+        float lightType = light.positionOrDirection.w;
+
+        vec3 L;
+        float attenuation = 1.0;
+
+        if (lightType < 0.5) {
+            // Directional light (w=0): direction points toward the light source
+            L = normalize(-light.positionOrDirection.xyz);
+        } else {
+            // Point (w=1) or spot (w=2) light
+            vec3 toLight = light.positionOrDirection.xyz - fragWorldPos;
+            float dist = length(toLight);
+            L = toLight / max(dist, 0.0001);
+
+            // Distance attenuation (inverse-square with range cutoff)
+            float rangeAtt = max(1.0 - pow(dist / light.range, 4.0), 0.0);
+            attenuation = (rangeAtt * rangeAtt) / max(dist * dist, 0.0001);
+
+            // Spot cone attenuation (w=2)
+            if (lightType > 1.5) {
+                // spotAngles.x = cos(inner), spotAngles.y = cos(outer)
+                // Note: direction for spot needs to be stored; for now use -L as approximation
+                // TODO: store spot direction separately when GpuLight is extended
+                float theta = dot(-L, normalize(-light.positionOrDirection.xyz));
+                float epsilon = light.spotAngles.x - light.spotAngles.y;
+                float spotAtt = clamp((theta - light.spotAngles.y) / max(epsilon, 0.0001), 0.0, 1.0);
+                attenuation *= spotAtt;
+            }
+        }
+
+        vec3 radiance = light.color * light.intensity * attenuation;
+
+        vec3 H = normalize(V + L);
+        float NdotL = max(dot(N, L), 0.0);
         float NdotH = max(dot(N, H), 0.0);
         float HdotV = max(dot(H, V), 0.0);
 
@@ -113,9 +158,8 @@ void main() {
         vec3  F = fresnelSchlick(HdotV, F0);
 
         vec3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
-
         vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
-        Lo += (kD * albedo / PI + specular) * lightColor * NdotL;
+        Lo += (kD * albedo / PI + specular) * radiance * NdotL;
     }
 
     // Image-based lighting (IBL) from environment map
