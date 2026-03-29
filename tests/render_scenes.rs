@@ -226,6 +226,7 @@ fn test_helmet_env() {
     // Skip if the environment map asset is not available
     let scene_path = project_root().join("scenes").join("helmet_env.json");
     let scene_content = std::fs::read_to_string(&scene_path).expect("read helmet_env.json");
+    #[allow(clippy::collapsible_if)]
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&scene_content) {
         if let Some(map_path) = json
             .get("environment")

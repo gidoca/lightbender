@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1773,6 +1775,7 @@ unsafe fn pick_physical_device(
         });
 
         if let (Some(gfx), Some(prs)) = (graphics_family, present_family) {
+            #[allow(clippy::collapsible_if)]
             if has_swapchain {
                 let score = match props.device_type {
                     vk::PhysicalDeviceType::DISCRETE_GPU => 1000,
