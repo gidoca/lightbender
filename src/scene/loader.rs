@@ -238,14 +238,17 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
     }
 
     // If no models were specified, create an empty scene
-    let scene = merged.unwrap_or_else(|| {
-        unsafe {
-            let pool = renderer.device().create_descriptor_pool(
-                &ash::vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(&[]),
-                None,
-            ).unwrap_or(ash::vk::DescriptorPool::null());
+    let scene = match merged {
+        Some(s) => s,
+        None => {
+            let pool = unsafe {
+                renderer.device().create_descriptor_pool(
+                    &ash::vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(1)
+                        .pool_sizes(&[]),
+                    None,
+                ).context("create empty scene descriptor pool")?
+            };
             Scene {
                 nodes: vec![],
                 meshes: vec![],
@@ -255,7 +258,7 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
                 descriptor_pool: pool,
             }
         }
-    });
+    };
 
     Ok(LoadedScene { scene, description: desc })
 }
