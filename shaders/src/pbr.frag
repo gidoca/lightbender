@@ -35,6 +35,14 @@ layout(set = 1, binding = 4) uniform sampler2D texEmissive;
 // Environment map (set 2)
 layout(set = 2, binding = 0) uniform sampler2D envMap;
 
+// Material factors (push constants, offset 64)
+layout(push_constant) uniform MaterialFactors {
+    layout(offset = 64) vec4  baseColorFactor;
+    layout(offset = 80) vec3  emissiveFactor;
+    layout(offset = 92) float metallicFactor;
+    layout(offset = 96) float roughnessFactor;
+} material;
+
 const float PI = 3.14159265359;
 
 // ── PBR helper functions ──────────────────────────────────────────────────────
@@ -77,12 +85,16 @@ void main() {
     float occlusion         = texture(texOcclusion, fragUV).r;
     vec3 emissive           = texture(texEmissive, fragUV).rgb;
 
+    // Apply material factors
+    baseColorSample *= material.baseColorFactor;
+    emissive = emissive * material.emissiveFactor;
+
     // Alpha cutout
     if (baseColorSample.a < 0.01) discard;
 
     vec3 albedo    = pow(baseColorSample.rgb, vec3(2.2)); // sRGB → linear
-    float metallic  = metallicRoughness.x;
-    float roughness = max(metallicRoughness.y, 0.04);
+    float metallic  = metallicRoughness.x * material.metallicFactor;
+    float roughness = max(metallicRoughness.y * material.roughnessFactor, 0.04);
 
     // Normal mapping
     vec3 N = normalSample * 2.0 - 1.0;

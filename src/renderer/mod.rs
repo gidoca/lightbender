@@ -11,7 +11,7 @@ use winit::window::Window;
 use crate::camera::Camera;
 use crate::scene::{gltf_loader::LoadContext, GpuTexture, Scene};
 use crate::shader::ShaderPair;
-use crate::types::{FrameUniforms, GpuLight, GpuVertex, MAX_LIGHTS};
+use crate::types::{FrameUniforms, GpuLight, GpuVertex, MaterialPushConstants, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 use crate::vulkan::image::GpuImage;
 
@@ -1280,9 +1280,24 @@ impl Renderer {
                 self.device.cmd_push_constants(
                     cmd,
                     self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
                     model_bytes,
+                );
+
+                let mat_push = MaterialPushConstants {
+                    base_color_factor: mat.base_color_factor,
+                    emissive_factor:   mat.emissive_factor,
+                    metallic_factor:   mat.metallic_factor,
+                    roughness_factor:  mat.roughness_factor,
+                    _pad:              [0.0; 3],
+                };
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    64,
+                    bytemuck::bytes_of(&mat_push),
                 );
 
                 self.device.cmd_bind_vertex_buffers(cmd, 0, &[prim.vertex_buffer.buffer], &[0]);
@@ -1297,9 +1312,23 @@ impl Renderer {
             self.device.cmd_push_constants(
                 cmd,
                 self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 model_bytes,
+            );
+            let default_mat = MaterialPushConstants {
+                base_color_factor: [1.0, 1.0, 1.0, 1.0],
+                emissive_factor:   [0.0, 0.0, 0.0],
+                metallic_factor:   1.0,
+                roughness_factor:  1.0,
+                _pad:              [0.0; 3],
+            };
+            self.device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                64,
+                bytemuck::bytes_of(&default_mat),
             );
             self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.buffer], &[0]);
             self.device.cmd_bind_index_buffer(cmd, self.index_buffer.buffer, 0, vk::IndexType::UINT32);
@@ -2260,9 +2289,9 @@ unsafe fn create_pipeline(
 
     let set_layouts = [descriptor_set_layout, material_set_layout, env_set_layout];
     let push_constant_range = vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
-        .size(64); // mat4
+        .size(64 + std::mem::size_of::<MaterialPushConstants>() as u32); // mat4 + material factors
     let layout = device
         .create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()

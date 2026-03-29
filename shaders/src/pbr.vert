@@ -12,7 +12,12 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
 } frame;
 
 layout(push_constant) uniform PushConstants {
-    mat4 model;
+    mat4 model;         // offset 0,  size 64
+    // Material factors at offset 64 (used by fragment shader only)
+    vec4  baseColorFactor;
+    vec3  emissiveFactor;
+    float metallicFactor;
+    float roughnessFactor;
 } push;
 
 layout(location = 0) out vec3 fragWorldPos;
