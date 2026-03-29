@@ -987,6 +987,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "lightbender-scene",
  "log",
  "ply-rs",
  "quick-xml 0.37.5",
@@ -996,6 +997,15 @@ dependencies = [
  "tempfile",
  "tobj",
  "winit",
+]
+
+[[package]]
+name = "lightbender-scene"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "serde",
 ]
 
 [[package]]
