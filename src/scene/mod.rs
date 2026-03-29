@@ -157,3 +157,124 @@ impl Scene {
         unsafe { device.destroy_descriptor_pool(self.descriptor_pool, None); }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use glam::{Quat, Vec3};
+
+    use super::*;
+
+    fn make_scene(nodes: Vec<SceneNode>) -> Scene {
+        Scene {
+            nodes,
+            meshes: vec![],
+            materials: vec![],
+            textures: vec![],
+            world_transforms: vec![],
+            descriptor_pool: vk::DescriptorPool::null(),
+        }
+    }
+
+    fn node(local: Transform, parent: Option<usize>) -> SceneNode {
+        SceneNode {
+            name: String::new(),
+            local_transform: local,
+            parent,
+            children: vec![],
+            mesh: None,
+        }
+    }
+
+    fn translation(x: f32, y: f32, z: f32) -> Transform {
+        Transform {
+            translation: Vec3::new(x, y, z),
+            ..Transform::default()
+        }
+    }
+
+    // ── Transform::to_mat4 ────────────────────────────────────────────────────
+
+    #[test]
+    fn transform_identity_is_identity_matrix() {
+        let m = Transform::default().to_mat4();
+        assert!((m - Mat4::IDENTITY).abs_diff_eq(Mat4::ZERO, 1e-6));
+    }
+
+    #[test]
+    fn transform_translation_only() {
+        let t = translation(1.0, 2.0, 3.0);
+        let m = t.to_mat4();
+        let translated = m * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        assert!((translated.x - 1.0).abs() < 1e-6);
+        assert!((translated.y - 2.0).abs() < 1e-6);
+        assert!((translated.z - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transform_scale_only() {
+        let t = Transform {
+            scale: Vec3::splat(2.0),
+            ..Transform::default()
+        };
+        let m = t.to_mat4();
+        let scaled = m * glam::Vec4::new(1.0, 1.0, 1.0, 1.0);
+        assert!((scaled.x - 2.0).abs() < 1e-6);
+        assert!((scaled.y - 2.0).abs() < 1e-6);
+        assert!((scaled.z - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transform_rotation_90_deg_y() {
+        // 90° around Y: (1,0,0) → (0,0,-1)
+        let t = Transform {
+            rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            ..Transform::default()
+        };
+        let m = t.to_mat4();
+        let rotated = m * glam::Vec4::new(1.0, 0.0, 0.0, 1.0);
+        assert!(rotated.x.abs() < 1e-5, "x={}", rotated.x);
+        assert!((rotated.z + 1.0).abs() < 1e-5, "z={}", rotated.z);
+    }
+
+    // ── Scene::update_world_transforms ───────────────────────────────────────
+
+    #[test]
+    fn update_world_transforms_single_root() {
+        let mut scene = make_scene(vec![node(translation(1.0, 0.0, 0.0), None)]);
+        scene.update_world_transforms();
+        let wt = scene.world_transforms[0];
+        let p = wt * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        assert!((p.x - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn update_world_transforms_parent_child() {
+        // parent at (1,0,0), child at (0,1,0) local → child world = (1,1,0)
+        let mut scene = make_scene(vec![
+            node(translation(1.0, 0.0, 0.0), None),
+            node(translation(0.0, 1.0, 0.0), Some(0)),
+        ]);
+        scene.update_world_transforms();
+        let child_world = scene.world_transforms[1];
+        let p = child_world * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        assert!((p.x - 1.0).abs() < 1e-6, "x={}", p.x);
+        assert!((p.y - 1.0).abs() < 1e-6, "y={}", p.y);
+        assert!(p.z.abs() < 1e-6, "z={}", p.z);
+    }
+
+    #[test]
+    fn update_world_transforms_deep_chain() {
+        // grandparent (1,0,0) → parent (0,1,0) → child (0,0,1) → world (1,1,1)
+        let mut scene = make_scene(vec![
+            node(translation(1.0, 0.0, 0.0), None),
+            node(translation(0.0, 1.0, 0.0), Some(0)),
+            node(translation(0.0, 0.0, 1.0), Some(1)),
+        ]);
+        scene.update_world_transforms();
+        let child_world = scene.world_transforms[2];
+        let p = child_world * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        assert!((p.x - 1.0).abs() < 1e-6, "x={}", p.x);
+        assert!((p.y - 1.0).abs() < 1e-6, "y={}", p.y);
+        assert!((p.z - 1.0).abs() < 1e-6, "z={}", p.z);
+    }
+}

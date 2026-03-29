@@ -273,3 +273,66 @@ fn compose_transforms(outer: &Transform, inner: &Transform) -> Transform {
     let (s, r, t) = m.to_scale_rotation_translation();
     Transform { translation: t, rotation: r, scale: s }
 }
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec3;
+
+    use super::*;
+
+    // ── resolve_path ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_path_absolute_passthrough() {
+        let base = Path::new("/some/dir");
+        let result = resolve_path(base, "/absolute/path/model.glb");
+        assert_eq!(result, PathBuf::from("/absolute/path/model.glb"));
+    }
+
+    #[test]
+    fn resolve_path_relative_joins_base() {
+        let base = Path::new("/scene/dir");
+        let result = resolve_path(base, "models/thing.glb");
+        assert_eq!(result, PathBuf::from("/scene/dir/models/thing.glb"));
+    }
+
+    // ── compose_transforms ────────────────────────────────────────────────────
+
+    #[test]
+    fn compose_transforms_both_identity() {
+        let id = Transform::default();
+        let result = compose_transforms(&id, &id);
+        assert!(result.translation.length() < 1e-6);
+        assert!((result.scale - Vec3::ONE).length() < 1e-6);
+    }
+
+    #[test]
+    fn compose_transforms_translation_adds() {
+        let outer = Transform {
+            translation: Vec3::new(1.0, 0.0, 0.0),
+            ..Transform::default()
+        };
+        let inner = Transform {
+            translation: Vec3::new(0.0, 1.0, 0.0),
+            ..Transform::default()
+        };
+        let result = compose_transforms(&outer, &inner);
+        assert!((result.translation.x - 1.0).abs() < 1e-5, "x={}", result.translation.x);
+        assert!((result.translation.y - 1.0).abs() < 1e-5, "y={}", result.translation.y);
+        assert!(result.translation.z.abs() < 1e-5, "z={}", result.translation.z);
+    }
+
+    #[test]
+    fn compose_transforms_scale_multiplies() {
+        let outer = Transform {
+            scale: Vec3::splat(2.0),
+            ..Transform::default()
+        };
+        let inner = Transform {
+            scale: Vec3::splat(3.0),
+            ..Transform::default()
+        };
+        let result = compose_transforms(&outer, &inner);
+        assert!((result.scale.x - 6.0).abs() < 1e-5, "scale={}", result.scale.x);
+    }
+}
