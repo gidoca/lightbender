@@ -50,13 +50,11 @@ fn main() -> anyhow::Result<()> {
             }
             arg => {
                 let path = PathBuf::from(arg);
-                input_path = Some(
-                    if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                        InputPath::Scene(path)
-                    } else {
-                        InputPath::Model(path)
-                    },
-                );
+                input_path = Some(match path.extension().and_then(|e| e.to_str()) {
+                    Some("json") => InputPath::Scene(path),
+                    Some("xml")  => InputPath::MitsubaScene(path),
+                    _            => InputPath::Model(path),
+                });
             }
         }
         i += 1;
