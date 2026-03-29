@@ -27,6 +27,94 @@ pub fn load_mitsuba(_renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaSc
     anyhow::bail!("Mitsuba scene loading not yet implemented")
 }
 
+// ── Sensor (camera) parsing ──────────────────────────────────────────────────
+
+struct MitsubaCameraDesc {
+    fov_y:    f32, // degrees
+    near:     f32,
+    far:      f32,
+    to_world: Mat4,
+}
+
+impl Default for MitsubaCameraDesc {
+    fn default() -> Self {
+        Self {
+            fov_y:    45.0,
+            near:     0.01,
+            far:      1000.0,
+            to_world: Mat4::IDENTITY,
+        }
+    }
+}
+
+/// Parse a `<sensor>` element. Reader is positioned just after `<sensor ...>`.
+fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
+    let mut desc = MitsubaCameraDesc::default();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf).context("parse_sensor")? {
+            Event::Empty(ref e) => {
+                let tag = e.name();
+                if tag.as_ref() == b"float" {
+                    if let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value")) {
+                        match name.as_str() {
+                            "fov" => desc.fov_y = val,
+                            "near_clip" => desc.near = val,
+                            "far_clip" => desc.far = val,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Event::Start(ref e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "transform" => {
+                        desc.to_world = parse_transform(reader)?;
+                    }
+                    _ => {
+                        // Skip film, sampler, etc.
+                        let end = e.to_end().into_owned();
+                        let mut skip_buf = Vec::new();
+                        reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                    }
+                }
+            }
+            Event::End(ref e) if e.name().as_ref() == b"sensor" => break,
+            Event::Eof => anyhow::bail!("unexpected EOF inside <sensor>"),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(desc)
+}
+
+/// Convert Mitsuba camera description to an OrbitalCamera.
+fn camera_from_mitsuba(desc: &MitsubaCameraDesc) -> OrbitalCamera {
+    // Extract camera position from to_world matrix (column 3)
+    let origin = desc.to_world.col(3).truncate();
+    // Forward direction is -Z in camera space
+    let forward = -desc.to_world.col(2).truncate().normalize();
+    // Place the look-at target 1 unit ahead in the forward direction,
+    // then use the distance from origin to target for the orbital distance.
+    let distance = 5.0; // default orbital distance
+    let target = origin + forward * distance;
+
+    // Compute yaw and pitch from the offset vector (origin - target)
+    let offset = origin - target;
+    let dist = offset.length().max(0.001);
+    let pitch = (offset.y / dist).asin();
+    let yaw = offset.z.atan2(offset.x) - std::f32::consts::FRAC_PI_2;
+
+    let mut cam = OrbitalCamera::new(target, dist, yaw.to_degrees(), pitch.to_degrees());
+    cam.camera.fov_y = desc.fov_y.to_radians();
+    cam.camera.near = desc.near;
+    cam.camera.far = desc.far;
+    cam
+}
+
 // ── XML helpers ──────────────────────────────────────────────────────────────
 
 /// Get an attribute value by name from a quick-xml BytesStart element.
@@ -276,6 +364,44 @@ mod tests {
         assert!((origin.x - 0.0).abs() < 1e-5);
         assert!((origin.y - 0.0).abs() < 1e-5);
         assert!((origin.z - 5.0).abs() < 1e-5);
+    }
+
+    fn parse_sensor_str(xml: &str) -> Result<MitsubaCameraDesc> {
+        let full = format!("<sensor type=\"perspective\">{xml}</sensor>");
+        let mut reader = Reader::from_str(&full);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf)? {
+                Event::Start(ref e) if e.name().as_ref() == b"sensor" => break,
+                Event::Eof => anyhow::bail!("no <sensor> found"),
+                _ => {}
+            }
+            buf.clear();
+        }
+        parse_sensor(&mut reader)
+    }
+
+    #[test]
+    fn test_sensor_basic() {
+        let desc = parse_sensor_str(r#"
+            <float name="fov" value="60"/>
+            <float name="near_clip" value="0.1"/>
+            <float name="far_clip" value="500"/>
+            <transform name="to_world">
+                <lookat origin="0, 5, 10" target="0, 0, 0" up="0, 1, 0"/>
+            </transform>
+        "#).unwrap();
+
+        assert!((desc.fov_y - 60.0).abs() < 1e-6);
+        assert!((desc.near - 0.1).abs() < 1e-6);
+        assert!((desc.far - 500.0).abs() < 1e-6);
+
+        let cam = camera_from_mitsuba(&desc);
+        // Camera should be roughly at (0, 5, 10)
+        let pos = cam.camera.position;
+        assert!((pos.x).abs() < 0.5, "x={}", pos.x);
+        assert!((pos.y - 5.0).abs() < 0.5, "y={}", pos.y);
+        assert!((pos.z - 10.0).abs() < 0.5, "z={}", pos.z);
     }
 
     #[test]
