@@ -212,6 +212,321 @@ fn gpu_light_from_emitter(emitter: &MitsubaEmitter, to_world: &Mat4) -> Option<G
     }
 }
 
+// ── Shape parsing ────────────────────────────────────────────────────────────
+
+use crate::types::GpuVertex;
+
+/// Parsed Mitsuba shape with geometry and material reference.
+struct MitsubaShape {
+    vertices:    Vec<GpuVertex>,
+    indices:     Vec<u32>,
+    to_world:    Mat4,
+    material:    Option<MitsubaMaterial>,
+    material_ref: Option<String>,  // id reference to top-level BSDF
+    area_emitter: Option<MitsubaEmitter>,
+}
+
+/// Parse a `<shape>` element. Reader positioned just after `<shape type="...">`.
+fn parse_shape(reader: &mut Reader<&[u8]>, shape_type: &str, base_dir: &Path) -> Result<MitsubaShape> {
+    let mut to_world = Mat4::IDENTITY;
+    let mut material: Option<MitsubaMaterial> = None;
+    let mut material_ref: Option<String> = None;
+    let mut area_emitter: Option<MitsubaEmitter> = None;
+    let mut filename: Option<String> = None;
+    let mut buf = Vec::new();
+    let mut skip_buf = Vec::new();
+
+    // shape-specific properties
+    let mut center = Vec3::ZERO;
+    let mut radius = 1.0f32;
+    let mut flip_normals = false;
+
+    loop {
+        match reader.read_event_into(&mut buf).context("parse_shape")? {
+            Event::Empty(ref e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "string" => {
+                        if attr_str(e, "name").as_deref() == Some("filename") {
+                            filename = attr_str(e, "value");
+                        }
+                    }
+                    "float" => {
+                        if let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value")) {
+                            match name.as_str() {
+                                "radius" => radius = val,
+                                _ => {}
+                            }
+                        }
+                    }
+                    "point" => {
+                        if attr_str(e, "name").as_deref() == Some("center") {
+                            if let (Some(x), Some(y), Some(z)) = (attr_f32(e, "x"), attr_f32(e, "y"), attr_f32(e, "z")) {
+                                center = Vec3::new(x, y, z);
+                            }
+                        }
+                    }
+                    "boolean" => {
+                        if attr_str(e, "name").as_deref() == Some("flip_normals") {
+                            flip_normals = attr_str(e, "value").as_deref() == Some("true");
+                        }
+                    }
+                    "ref" => {
+                        material_ref = attr_str(e, "id");
+                    }
+                    _ => {}
+                }
+            }
+            Event::Start(ref e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "transform" => {
+                        to_world = parse_transform(reader)?;
+                    }
+                    "bsdf" => {
+                        let bsdf_type = attr_str(e, "type").unwrap_or_default();
+                        material = Some(parse_bsdf(reader, &bsdf_type)?);
+                    }
+                    "emitter" => {
+                        let emitter_type = attr_str(e, "type").unwrap_or_default();
+                        area_emitter = Some(parse_emitter(reader, &emitter_type)?);
+                    }
+                    "ref" => {
+                        material_ref = attr_str(e, "id");
+                        let end = e.to_end().into_owned();
+                        reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                        skip_buf.clear();
+                    }
+                    _ => {
+                        let end = e.to_end().into_owned();
+                        reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                        skip_buf.clear();
+                    }
+                }
+            }
+            Event::End(ref e) if e.name().as_ref() == b"shape" => break,
+            Event::Eof => anyhow::bail!("unexpected EOF inside <shape>"),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    // Build geometry based on shape type
+    let (vertices, indices) = match shape_type {
+        "obj" => {
+            let path = resolve_path(base_dir, &filename.context("<shape type=\"obj\"> missing 'filename'")?);
+            let meshes = super::obj_loader::load_obj(&path)?;
+            merge_obj_meshes(meshes)
+        }
+        "ply" => {
+            let path = resolve_path(base_dir, &filename.context("<shape type=\"ply\"> missing 'filename'")?);
+            let mesh = super::ply_loader::load_ply(&path)?;
+            (mesh.vertices, mesh.indices)
+        }
+        "sphere" => {
+            generate_sphere(center, radius, 32, 16, flip_normals)
+        }
+        "rectangle" => generate_rectangle(flip_normals),
+        "cube" => generate_cube(),
+        "disk" => generate_disk(32, flip_normals),
+        "cylinder" => generate_cylinder(32, flip_normals),
+        _ => {
+            log::warn!("Unsupported shape type: {shape_type}");
+            (Vec::new(), Vec::new())
+        }
+    };
+
+    Ok(MitsubaShape {
+        vertices,
+        indices,
+        to_world,
+        material,
+        material_ref,
+        area_emitter,
+    })
+}
+
+fn resolve_path(base: &Path, relative: &str) -> std::path::PathBuf {
+    let p = Path::new(relative);
+    if p.is_absolute() { p.to_path_buf() } else { base.join(p) }
+}
+
+fn merge_obj_meshes(meshes: Vec<super::obj_loader::ObjMesh>) -> (Vec<GpuVertex>, Vec<u32>) {
+    let mut all_verts = Vec::new();
+    let mut all_indices = Vec::new();
+    for mesh in meshes {
+        let base = all_verts.len() as u32;
+        all_verts.extend(mesh.vertices);
+        all_indices.extend(mesh.indices.iter().map(|&i| i + base));
+    }
+    (all_verts, all_indices)
+}
+
+// ── Procedural geometry generators ───────────────────────────────────────────
+
+fn generate_sphere(center: Vec3, radius: f32, slices: u32, stacks: u32, flip: bool) -> (Vec<GpuVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let sign = if flip { -1.0f32 } else { 1.0 };
+
+    for j in 0..=stacks {
+        let theta = std::f32::consts::PI * j as f32 / stacks as f32;
+        let sin_t = theta.sin();
+        let cos_t = theta.cos();
+
+        for i in 0..=slices {
+            let phi = 2.0 * std::f32::consts::PI * i as f32 / slices as f32;
+            let nx = sin_t * phi.cos();
+            let ny = cos_t;
+            let nz = sin_t * phi.sin();
+
+            vertices.push(GpuVertex {
+                position: [center.x + radius * nx, center.y + radius * ny, center.z + radius * nz],
+                normal:   [sign * nx, sign * ny, sign * nz],
+                uv:       [i as f32 / slices as f32, j as f32 / stacks as f32],
+                tangent:  [1.0, 0.0, 0.0, 1.0],
+            });
+        }
+    }
+
+    for j in 0..stacks {
+        for i in 0..slices {
+            let a = j * (slices + 1) + i;
+            let b = a + slices + 1;
+            if flip {
+                indices.extend_from_slice(&[a, b, a + 1, b, b + 1, a + 1]);
+            } else {
+                indices.extend_from_slice(&[a, a + 1, b, b, a + 1, b + 1]);
+            }
+        }
+    }
+
+    super::obj_loader::compute_tangents(&mut vertices, &indices);
+    (vertices, indices)
+}
+
+fn generate_rectangle(flip: bool) -> (Vec<GpuVertex>, Vec<u32>) {
+    // Mitsuba rectangle: centered at origin, in XY plane, extends [-1,1] x [-1,1], normal +Z
+    let sign = if flip { -1.0 } else { 1.0 };
+    let vertices = vec![
+        GpuVertex { position: [-1.0, -1.0, 0.0], normal: [0.0, 0.0, sign], uv: [0.0, 0.0], tangent: [1.0, 0.0, 0.0, 1.0] },
+        GpuVertex { position: [ 1.0, -1.0, 0.0], normal: [0.0, 0.0, sign], uv: [1.0, 0.0], tangent: [1.0, 0.0, 0.0, 1.0] },
+        GpuVertex { position: [ 1.0,  1.0, 0.0], normal: [0.0, 0.0, sign], uv: [1.0, 1.0], tangent: [1.0, 0.0, 0.0, 1.0] },
+        GpuVertex { position: [-1.0,  1.0, 0.0], normal: [0.0, 0.0, sign], uv: [0.0, 1.0], tangent: [1.0, 0.0, 0.0, 1.0] },
+    ];
+    let indices = if flip {
+        vec![0, 2, 1, 0, 3, 2]
+    } else {
+        vec![0, 1, 2, 0, 2, 3]
+    };
+    (vertices, indices)
+}
+
+fn generate_cube() -> (Vec<GpuVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        ([0.0, 0.0, 1.0],  [[-1.0,-1.0, 1.0], [ 1.0,-1.0, 1.0], [ 1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]]),  // +Z
+        ([0.0, 0.0,-1.0],  [[ 1.0,-1.0,-1.0], [-1.0,-1.0,-1.0], [-1.0, 1.0,-1.0], [ 1.0, 1.0,-1.0]]),  // -Z
+        ([1.0, 0.0, 0.0],  [[ 1.0,-1.0, 1.0], [ 1.0,-1.0,-1.0], [ 1.0, 1.0,-1.0], [ 1.0, 1.0, 1.0]]),  // +X
+        ([-1.0,0.0, 0.0],  [[-1.0,-1.0,-1.0], [-1.0,-1.0, 1.0], [-1.0, 1.0, 1.0], [-1.0, 1.0,-1.0]]),  // -X
+        ([0.0, 1.0, 0.0],  [[-1.0, 1.0, 1.0], [ 1.0, 1.0, 1.0], [ 1.0, 1.0,-1.0], [-1.0, 1.0,-1.0]]),  // +Y
+        ([0.0,-1.0, 0.0],  [[-1.0,-1.0,-1.0], [ 1.0,-1.0,-1.0], [ 1.0,-1.0, 1.0], [-1.0,-1.0, 1.0]]),  // -Y
+    ];
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+
+    for (normal, positions) in &faces {
+        let base = vertices.len() as u32;
+        for (i, pos) in positions.iter().enumerate() {
+            vertices.push(GpuVertex {
+                position: *pos,
+                normal: *normal,
+                uv: uvs[i],
+                tangent: [1.0, 0.0, 0.0, 1.0],
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    super::obj_loader::compute_tangents(&mut vertices, &indices);
+    (vertices, indices)
+}
+
+fn generate_disk(segments: u32, flip: bool) -> (Vec<GpuVertex>, Vec<u32>) {
+    let sign = if flip { -1.0 } else { 1.0 };
+    let mut vertices = vec![GpuVertex {
+        position: [0.0, 0.0, 0.0],
+        normal: [0.0, 0.0, sign],
+        uv: [0.5, 0.5],
+        tangent: [1.0, 0.0, 0.0, 1.0],
+    }];
+    let mut indices = Vec::new();
+
+    for i in 0..=segments {
+        let angle = 2.0 * std::f32::consts::PI * i as f32 / segments as f32;
+        let x = angle.cos();
+        let y = angle.sin();
+        vertices.push(GpuVertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, sign],
+            uv: [0.5 + x * 0.5, 0.5 + y * 0.5],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        });
+    }
+
+    for i in 1..=segments {
+        if flip {
+            indices.extend_from_slice(&[0, i + 1, i]);
+        } else {
+            indices.extend_from_slice(&[0, i, i + 1]);
+        }
+    }
+
+    (vertices, indices)
+}
+
+fn generate_cylinder(segments: u32, flip: bool) -> (Vec<GpuVertex>, Vec<u32>) {
+    let sign = if flip { -1.0 } else { 1.0 };
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Side wall
+    for i in 0..=segments {
+        let angle = 2.0 * std::f32::consts::PI * i as f32 / segments as f32;
+        let x = angle.cos();
+        let y = angle.sin();
+        let u = i as f32 / segments as f32;
+
+        // Bottom vertex
+        vertices.push(GpuVertex {
+            position: [x, y, 0.0],
+            normal: [sign * x, sign * y, 0.0],
+            uv: [u, 0.0],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        });
+        // Top vertex
+        vertices.push(GpuVertex {
+            position: [x, y, 1.0],
+            normal: [sign * x, sign * y, 0.0],
+            uv: [u, 1.0],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        });
+    }
+
+    for i in 0..segments {
+        let b = i * 2;
+        if flip {
+            indices.extend_from_slice(&[b, b + 3, b + 1, b, b + 2, b + 3]);
+        } else {
+            indices.extend_from_slice(&[b, b + 1, b + 3, b, b + 3, b + 2]);
+        }
+    }
+
+    super::obj_loader::compute_tangents(&mut vertices, &indices);
+    (vertices, indices)
+}
+
 // ── BSDF (material) parsing ──────────────────────────────────────────────────
 
 /// Parsed Mitsuba BSDF mapped to PBR parameters.
@@ -980,5 +1295,27 @@ mod tests {
         assert!((p.x - 2.0).abs() < 1e-5);
         assert!((p.y - 0.0).abs() < 1e-5);
         assert!((p.z - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_generate_sphere() {
+        let (verts, indices) = generate_sphere(Vec3::ZERO, 1.0, 16, 8, false);
+        assert!(!verts.is_empty());
+        assert!(!indices.is_empty());
+        assert_eq!(indices.len() % 3, 0); // all triangles
+    }
+
+    #[test]
+    fn test_generate_rectangle() {
+        let (verts, indices) = generate_rectangle(false);
+        assert_eq!(verts.len(), 4);
+        assert_eq!(indices.len(), 6);
+    }
+
+    #[test]
+    fn test_generate_cube() {
+        let (verts, indices) = generate_cube();
+        assert_eq!(verts.len(), 24); // 6 faces * 4 vertices
+        assert_eq!(indices.len(), 36); // 6 faces * 2 triangles * 3 indices
     }
 }
