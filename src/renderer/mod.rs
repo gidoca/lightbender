@@ -1332,10 +1332,10 @@ impl Renderer {
     }
 
     /// Set the environment map texture and IBL intensity. Updates all env descriptor sets.
-    pub fn set_environment_map(&mut self, texture: GpuTexture, intensity: f32) {
+    pub fn set_environment_map(&mut self, texture: GpuTexture, intensity: f32) -> Result<()> {
         self.env_intensity = intensity;
         unsafe {
-            self.device.device_wait_idle().ok();
+            self.device.device_wait_idle()?;
 
             // Update descriptor sets to point to the new texture
             for &ds in &self.env_descriptor_sets {
@@ -1359,6 +1359,7 @@ impl Renderer {
 
             self.env_texture = Some(texture);
         }
+        Ok(())
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -2472,11 +2473,9 @@ unsafe extern "system" fn vulkan_debug_callback(
     data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _user_data: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
-    let msg = unsafe {
-        std::ffi::CStr::from_ptr((*data).p_message)
-            .to_str()
-            .unwrap_or("<invalid utf8>")
-    };
+    let msg = std::ffi::CStr::from_ptr((*data).p_message)
+        .to_str()
+        .unwrap_or("<invalid utf8>");
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         log::error!("[Vulkan] {msg}");
     } else {

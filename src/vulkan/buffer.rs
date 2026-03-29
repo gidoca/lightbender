@@ -52,7 +52,7 @@ impl GpuBuffer {
         data: &[T],
     ) -> Result<()> {
         let bytes = bytemuck::cast_slice(data);
-        debug_assert!(bytes.len() as vk::DeviceSize <= self.size);
+        assert!(bytes.len() as vk::DeviceSize <= self.size, "upload_slice: data ({} bytes) exceeds buffer size ({})", bytes.len(), self.size);
         let ptr = device
             .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
             .context("map memory")?;

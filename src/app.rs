@@ -140,7 +140,7 @@ pub fn load_scene_from_input(
                         match load_and_upload_env_map(renderer, &resolved) {
                             Ok(tex) => {
                                 let intensity = loaded.description.environment.map_intensity;
-                                renderer.set_environment_map(tex, intensity);
+                                renderer.set_environment_map(tex, intensity)?;
                                 log::info!("Loaded environment map: {} (intensity={})", resolved.display(), intensity);
                             }
                             Err(e) => log::error!("Failed to load environment map: {e:#}"),
