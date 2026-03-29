@@ -13,6 +13,14 @@ use crate::types::{FrameUniforms, GpuVertex, MAX_LIGHTS};
 use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
 use crate::vulkan::image::GpuImage;
 
+type SwapchainInfo = (
+    vk::SwapchainKHR,
+    Vec<vk::Image>,
+    Vec<vk::ImageView>,
+    vk::Format,
+    vk::Extent2D,
+);
+
 const FRAMES_IN_FLIGHT: usize = 2;
 const PIPELINE_CACHE_FILE: &str = "pipeline_cache.bin";
 
@@ -1837,13 +1845,7 @@ unsafe fn create_swapchain(
     swapchain_loader: &ash::khr::swapchain::Device,
     old_swapchain: vk::SwapchainKHR,
     window: &Window,
-) -> Result<(
-    vk::SwapchainKHR,
-    Vec<vk::Image>,
-    Vec<vk::ImageView>,
-    vk::Format,
-    vk::Extent2D,
-)> {
+) -> Result<SwapchainInfo> {
     let capabilities =
         surface_loader.get_physical_device_surface_capabilities(physical_device, surface)?;
     let formats =

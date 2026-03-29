@@ -13,6 +13,7 @@ pub struct GpuImage {
 
 impl GpuImage {
     /// Upload RGBA8 pixel data to a DEVICE_LOCAL 2D image.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn upload_rgba8(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -146,6 +147,7 @@ impl GpuImage {
     }
 
     /// Upload RGBA float32 pixel data to a DEVICE_LOCAL 2D image (R32G32B32A32_SFLOAT).
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn upload_rgba32f(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -292,6 +294,7 @@ pub fn load_hdr_to_rgba32f(path: &Path) -> Result<(u32, u32, Vec<f32>)> {
     Ok((w, h, pixels))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transition_layout(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
