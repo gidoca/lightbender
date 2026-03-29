@@ -892,6 +892,13 @@ struct MitsubaMaterial {
     emissive:      Vec3,
     double_sided:  bool,
     base_color_texture: Option<String>, // path to bitmap texture
+    // Extended properties for improved BSDF mapping
+    int_ior:              Option<f32>,
+    ext_ior:              Option<f32>,
+    specular_reflectance: Option<Vec3>,
+    conductor_material:   Option<String>, // e.g. "Au", "Cu", "Ag"
+    eta:                  Option<Vec3>,   // complex IOR (real part)
+    k:                    Option<Vec3>,   // complex IOR (imaginary part)
 }
 
 impl Default for MitsubaMaterial {
@@ -903,6 +910,12 @@ impl Default for MitsubaMaterial {
             emissive:      Vec3::ZERO,
             double_sided:  false,
             base_color_texture: None,
+            int_ior:              None,
+            ext_ior:              None,
+            specular_reflectance: None,
+            conductor_material:   None,
+            eta:                  None,
+            k:                    None,
         }
     }
 }
@@ -990,20 +1003,29 @@ fn handle_bsdf_property(e: &quick_xml::events::BytesStart, tag: &str, mat: &mut 
             {
                 match name.as_str() {
                     "reflectance" | "diffuse_reflectance" | "base_color" => mat.base_color = c,
-                    "specular_reflectance" => {} // handled in type mapping
+                    "specular_reflectance" => mat.specular_reflectance = Some(c),
+                    "eta" => mat.eta = Some(c),
+                    "k" => mat.k = Some(c),
                     _ => {}
                 }
             }
         }
         "float" => {
-            if let Some(v) = attr_f32(e, "value")
-                && name == "alpha"
-            {
-                mat.roughness = v;
+            if let Some(v) = attr_f32(e, "value") {
+                match name.as_str() {
+                    "alpha" => mat.roughness = v,
+                    "int_ior" => mat.int_ior = Some(v),
+                    "ext_ior" => mat.ext_ior = Some(v),
+                    _ => {}
+                }
             }
         }
         "string" => {
-            // 'material' name for conductors handled in type mapping
+            if let Some(v) = attr_str(e, "value") {
+                if name == "material" {
+                    mat.conductor_material = Some(v);
+                }
+            }
         }
         _ => {}
     }
@@ -1016,28 +1038,43 @@ fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
             mat.metallic = 0.0;
             mat.roughness = 1.0;
         }
-        "roughplastic" => {
+        "roughplastic" | "plastic" => {
             mat.metallic = 0.0;
-            // roughness already set from 'alpha'
+            if bsdf_type == "plastic" {
+                mat.roughness = 0.01;
+            }
+            // Compute F0 from IOR for dielectric fresnel
+            let int_ior = mat.int_ior.unwrap_or(1.49); // default polypropylene
+            let ext_ior = mat.ext_ior.unwrap_or(1.000277);
+            let f0_scalar = ((int_ior - ext_ior) / (int_ior + ext_ior)).powi(2);
+            // For plastics, the specular reflectance modulates the Fresnel
+            if let Some(spec) = mat.specular_reflectance {
+                // Scale base color to account for energy conservation
+                mat.base_color = mat.base_color * (1.0 - spec.x.max(spec.y).max(spec.z) * f0_scalar);
+            }
+            let _ = f0_scalar; // F0 used implicitly via metallic=0 + dielectric fresnel in shader
         }
-        "plastic" => {
-            mat.metallic = 0.0;
-            mat.roughness = 0.1;
-        }
-        "roughconductor" => {
+        "roughconductor" | "conductor" => {
             mat.metallic = 1.0;
-            // roughness from 'alpha', base_color from material name (later step)
-        }
-        "conductor" => {
-            mat.metallic = 1.0;
-            mat.roughness = 0.01;
+            if bsdf_type == "conductor" {
+                mat.roughness = 0.01;
+            }
+            // Derive base_color (F0) from conductor properties
+            let f0 = conductor_f0(mat);
+            mat.base_color = f0;
         }
         "dielectric" | "roughdielectric" | "thindielectric" => {
             mat.metallic = 0.0;
             if bsdf_type == "dielectric" || bsdf_type == "thindielectric" {
                 mat.roughness = 0.0;
             }
-            // Transparency will be handled in Phase 2
+            // Approximate glass: mostly transparent with specular highlights
+            let int_ior = mat.int_ior.unwrap_or(1.5);
+            let ext_ior = mat.ext_ior.unwrap_or(1.000277);
+            let f0 = ((int_ior - ext_ior) / (int_ior + ext_ior)).powi(2);
+            // Use low alpha for transparency approximation
+            mat.base_color = Vec3::new(1.0 - f0, 1.0 - f0, 1.0 - f0);
+            mat.double_sided = true;
         }
         "twosided" => {
             // Handled after inner BSDF is parsed
@@ -1048,6 +1085,65 @@ fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
             }
         }
     }
+}
+
+/// Compute F0 (normal-incidence reflectance) for a conductor material.
+fn conductor_f0(mat: &MitsubaMaterial) -> Vec3 {
+    // If eta and k are specified directly, compute from complex IOR
+    if let (Some(eta), Some(k)) = (mat.eta, mat.k) {
+        return compute_conductor_f0(eta, k);
+    }
+
+    // If a named material is given, look up from table
+    if let Some(ref name) = mat.conductor_material {
+        if let Some(f0) = conductor_f0_table(name) {
+            // Apply specular_reflectance as a tint if provided
+            return if let Some(spec) = mat.specular_reflectance {
+                f0 * spec
+            } else {
+                f0
+            };
+        }
+    }
+
+    // If specular_reflectance is given, use directly
+    if let Some(spec) = mat.specular_reflectance {
+        return spec;
+    }
+
+    // Fallback: generic shiny metal
+    Vec3::new(0.9, 0.9, 0.9)
+}
+
+/// F0 from complex IOR: F0 = ((n-1)² + k²) / ((n+1)² + k²) per channel
+fn compute_conductor_f0(eta: Vec3, k: Vec3) -> Vec3 {
+    let f = |n: f32, kk: f32| -> f32 {
+        ((n - 1.0).powi(2) + kk.powi(2)) / ((n + 1.0).powi(2) + kk.powi(2))
+    };
+    Vec3::new(f(eta.x, k.x), f(eta.y, k.y), f(eta.z, k.z))
+}
+
+/// Lookup table for common conductor materials → F0 at normal incidence.
+/// Values are approximate sRGB F0 derived from spectral data.
+fn conductor_f0_table(name: &str) -> Option<Vec3> {
+    Some(match name {
+        "Au" | "gold"           => Vec3::new(1.000, 0.710, 0.290),
+        "Ag" | "silver"         => Vec3::new(0.950, 0.930, 0.880),
+        "Cu" | "copper"         => Vec3::new(0.950, 0.640, 0.540),
+        "Al" | "aluminum"       => Vec3::new(0.910, 0.920, 0.920),
+        "Fe" | "iron"           => Vec3::new(0.560, 0.570, 0.580),
+        "Cr" | "chromium"       => Vec3::new(0.550, 0.550, 0.550),
+        "Ni" | "nickel"         => Vec3::new(0.660, 0.610, 0.530),
+        "Ti" | "titanium"       => Vec3::new(0.540, 0.500, 0.430),
+        "W"  | "tungsten"       => Vec3::new(0.500, 0.510, 0.540),
+        "Pt" | "platinum"       => Vec3::new(0.670, 0.640, 0.590),
+        "Pb" | "lead"           => Vec3::new(0.630, 0.630, 0.630),
+        "Zn" | "zinc"           => Vec3::new(0.640, 0.620, 0.580),
+        "V"  | "vanadium"       => Vec3::new(0.530, 0.500, 0.470),
+        "Hg" | "mercury"        => Vec3::new(0.780, 0.780, 0.780),
+        "none" | "default"      => Vec3::new(0.900, 0.900, 0.900),
+        _ => return None,
+    })
 }
 
 // ── Property bag (generic Mitsuba property parsing) ──────────────────────────
