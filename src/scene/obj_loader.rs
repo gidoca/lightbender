@@ -7,6 +7,8 @@ use crate::types::GpuVertex;
 pub struct ObjMesh {
     pub vertices:       Vec<GpuVertex>,
     pub indices:        Vec<u32>,
+    /// Material index from OBJ MTL file (will be used for MTL material mapping).
+    #[allow(dead_code)]
     pub material_index: Option<usize>,
 }
 

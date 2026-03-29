@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use ash::vk;
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Vec3};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -550,7 +550,8 @@ fn gpu_light_from_emitter(emitter: &MitsubaEmitter, to_world: &Mat4) -> Option<G
         }
         MitsubaEmitter::Spot { position, direction, color, intensity, cutoff_angle } => {
             let world_pos = to_world.transform_point3(position);
-            let world_dir = to_world.transform_vector3(direction).normalize();
+            // TODO: store spot direction in GpuLight when light UBO is wired (step 12)
+            let _world_dir = to_world.transform_vector3(direction).normalize();
             let inner = (cutoff_angle * 0.75).to_radians().cos();
             let outer = cutoff_angle.to_radians().cos();
             Some(GpuLight {
@@ -607,9 +608,8 @@ fn parse_shape(reader: &mut Reader<&[u8]>, shape_type: &str, base_dir: &Path) ->
                     }
                     "float" => {
                         if let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value")) {
-                            match name.as_str() {
-                                "radius" => radius = val,
-                                _ => {}
+                            if name == "radius" {
+                                radius = val;
                             }
                         }
                     }
@@ -997,9 +997,8 @@ fn handle_bsdf_property(e: &quick_xml::events::BytesStart, tag: &str, mat: &mut 
         }
         "float" => {
             if let Some(v) = attr_f32(e, "value") {
-                match name.as_str() {
-                    "alpha" => mat.roughness = v,
-                    _ => {}
+                if name == "alpha" {
+                    mat.roughness = v;
                 }
             }
         }
