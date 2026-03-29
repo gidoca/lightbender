@@ -100,6 +100,11 @@ void main() {
     vec3 N = normalSample * 2.0 - 1.0;
     N = normalize(fragTBN * N);
 
+    // Flip normal for back-facing fragments (double-sided rendering)
+    if (!gl_FrontFacing) {
+        N = -N;
+    }
+
     vec3 V = normalize(frame.cameraPosition.xyz - fragWorldPos);
 
     // Reflectance at normal incidence (F0)
@@ -191,5 +196,12 @@ void main() {
     color = color / (color + vec3(1.0));
     color = pow(color, vec3(1.0 / 2.2));
 
-    outColor = vec4(color, baseColorSample.a);
+    // Output alpha: use base color alpha, modulated by Fresnel for transparent materials
+    float alpha = baseColorSample.a;
+    if (alpha < 1.0) {
+        // Increase opacity at grazing angles (Fresnel effect for glass-like materials)
+        float fresnel = pow(1.0 - max(dot(N, V), 0.0), 5.0);
+        alpha = mix(alpha, 1.0, fresnel);
+    }
+    outColor = vec4(color, alpha);
 }

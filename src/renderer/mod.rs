@@ -343,6 +343,11 @@ impl Renderer {
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
+        let (double_sided, transparent) = create_pipeline_variants(
+            &device, render_pass, pipeline_layout, pipeline_cache,
+        ).context("pipeline variants")?;
+        pipelines.insert("__double_sided".to_string(), double_sided);
+        pipelines.insert("__transparent".to_string(), transparent);
 
         // --- Skybox pipeline ---
         let skybox_pipeline = create_skybox_pipeline(
@@ -809,6 +814,11 @@ impl Renderer {
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
+        let (double_sided, transparent) = create_pipeline_variants(
+            &device, render_pass, pipeline_layout, pipeline_cache,
+        ).context("pipeline variants")?;
+        pipelines.insert("__double_sided".to_string(), double_sided);
+        pipelines.insert("__transparent".to_string(), transparent);
 
         // --- Skybox pipeline ---
         let skybox_pipeline = create_skybox_pipeline(
@@ -1253,13 +1263,31 @@ impl Renderer {
         }
 
         if let Some(scene) = scene {
-            for (world, prim) in scene.draw_primitives() {
+            let double_sided_pipeline = self.pipelines.get("__double_sided").copied();
+            let transparent_pipeline = self.pipelines.get("__transparent").copied();
+
+            // Collect draw calls, separating opaque and transparent
+            let primitives: Vec<_> = scene.draw_primitives().collect();
+            let (opaque, transparent): (Vec<_>, Vec<_>) = primitives.iter().partition(|(_, prim)| {
+                let mat = &scene.materials[prim.material];
+                mat.base_color_factor[3] >= 1.0
+            });
+
+            // Draw opaque primitives first, then transparent
+            for (world, prim) in opaque.iter().chain(transparent.iter()) {
                 let mat = &scene.materials[prim.material];
 
-                // Switch pipeline if this material requests a different one
-                let pipeline = mat.pipeline_name.as_deref()
-                    .and_then(|n| self.pipelines.get(n).copied())
-                    .unwrap_or(default_pipeline);
+                // Select pipeline: custom > double-sided > transparent > default
+                let is_transparent = mat.base_color_factor[3] < 1.0;
+                let pipeline = if let Some(name) = mat.pipeline_name.as_deref() {
+                    self.pipelines.get(name).copied().unwrap_or(default_pipeline)
+                } else if is_transparent {
+                    transparent_pipeline.unwrap_or(default_pipeline)
+                } else if mat.double_sided {
+                    double_sided_pipeline.unwrap_or(default_pipeline)
+                } else {
+                    default_pipeline
+                };
                 if pipeline != bound_pipeline {
                     self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     bound_pipeline = pipeline;
@@ -2278,7 +2306,8 @@ unsafe fn create_pipeline(
         .depth_bounds_test_enable(false);
 
     let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA);
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(false);
     let blend_attachments = [blend_attachment];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
@@ -2327,6 +2356,122 @@ unsafe fn create_pipeline(
     }
 
     Ok((layout, pipelines[0]))
+}
+
+/// Create pipeline variants (double-sided, transparent) from the PBR shaders.
+unsafe fn create_pipeline_variants(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline_cache: vk::PipelineCache,
+) -> Result<(vk::Pipeline, vk::Pipeline)> {
+    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/pbr.vert.spv"))
+        .context("load PBR vertex shader")?;
+    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/pbr.frag.spv"))
+        .context("load PBR fragment shader")?;
+    let vert_module = device
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)?;
+    let frag_module = device
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)?;
+
+    let entry_point = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry_point),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(entry_point),
+    ];
+
+    let vertex_binding = vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(std::mem::size_of::<GpuVertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX);
+    let vertex_attrs = [
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 12 },
+        vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 24 },
+        vk::VertexInputAttributeDescription { location: 3, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 32 },
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(std::slice::from_ref(&vertex_binding))
+        .vertex_attribute_descriptions(&vertex_attrs);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1).scissor_count(1);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true).depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+        .dynamic_states(&dynamic_states);
+
+    // ── Double-sided pipeline (cull_mode = NONE) ─────────────────────────
+    let rasterization_ds = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let blend_opaque = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let color_blend_opaque = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(&blend_opaque);
+
+    let ds_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages).vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly).viewport_state(&viewport_state)
+        .rasterization_state(&rasterization_ds).multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil).color_blend_state(&color_blend_opaque)
+        .dynamic_state(&dynamic_state).layout(pipeline_layout)
+        .render_pass(render_pass).subpass(0);
+
+    let double_sided_pipeline = device
+        .create_graphics_pipelines(pipeline_cache, &[ds_info], None)
+        .map_err(|(_, e)| e).context("double-sided pipeline")?[0];
+
+    // ── Transparent pipeline (alpha blending, no depth write) ────────────
+    let rasterization_tr = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let depth_stencil_tr = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true).depth_write_enable(false) // no depth write for transparency
+        .depth_compare_op(vk::CompareOp::LESS);
+    let blend_transparent = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)];
+    let color_blend_tr = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(&blend_transparent);
+
+    let tr_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages).vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly).viewport_state(&viewport_state)
+        .rasterization_state(&rasterization_tr).multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil_tr).color_blend_state(&color_blend_tr)
+        .dynamic_state(&dynamic_state).layout(pipeline_layout)
+        .render_pass(render_pass).subpass(0);
+
+    let transparent_pipeline = device
+        .create_graphics_pipelines(pipeline_cache, &[tr_info], None)
+        .map_err(|(_, e)| e).context("transparent pipeline")?[0];
+
+    device.destroy_shader_module(vert_module, None);
+    device.destroy_shader_module(frag_module, None);
+
+    Ok((double_sided_pipeline, transparent_pipeline))
 }
 
 unsafe fn create_env_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {

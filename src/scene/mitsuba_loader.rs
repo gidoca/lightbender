@@ -270,7 +270,7 @@ pub fn load_mitsuba(renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaSce
 
         let mat_idx = materials.len();
         materials.push(GpuMaterial {
-            base_color_factor:          [mat_desc.base_color.x, mat_desc.base_color.y, mat_desc.base_color.z, 1.0],
+            base_color_factor:          [mat_desc.base_color.x, mat_desc.base_color.y, mat_desc.base_color.z, mat_desc.alpha],
             metallic_factor:            mat_desc.metallic,
             roughness_factor:           mat_desc.roughness,
             emissive_factor:            [emissive.x, emissive.y, emissive.z],
@@ -887,6 +887,7 @@ fn generate_cylinder(segments: u32, flip: bool) -> (Vec<GpuVertex>, Vec<u32>) {
 #[derive(Clone, Debug)]
 struct MitsubaMaterial {
     base_color:    Vec3,
+    alpha:         f32, // opacity (1.0 = opaque)
     metallic:      f32,
     roughness:     f32,
     emissive:      Vec3,
@@ -905,6 +906,7 @@ impl Default for MitsubaMaterial {
     fn default() -> Self {
         Self {
             base_color:    Vec3::new(0.5, 0.5, 0.5),
+            alpha:         1.0,
             metallic:      0.0,
             roughness:     1.0,
             emissive:      Vec3::ZERO,
@@ -1068,12 +1070,12 @@ fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
             if bsdf_type == "dielectric" || bsdf_type == "thindielectric" {
                 mat.roughness = 0.0;
             }
-            // Approximate glass: mostly transparent with specular highlights
+            // Approximate glass: semi-transparent with specular highlights
             let int_ior = mat.int_ior.unwrap_or(1.5);
             let ext_ior = mat.ext_ior.unwrap_or(1.000277);
             let f0 = ((int_ior - ext_ior) / (int_ior + ext_ior)).powi(2);
-            // Use low alpha for transparency approximation
-            mat.base_color = Vec3::new(1.0 - f0, 1.0 - f0, 1.0 - f0);
+            mat.base_color = Vec3::ONE;
+            mat.alpha = f0.max(0.05); // at least slightly visible
             mat.double_sided = true;
         }
         "twosided" => {
