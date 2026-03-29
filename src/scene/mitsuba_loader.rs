@@ -7,6 +7,7 @@ use quick_xml::Reader;
 
 use crate::camera::OrbitalCamera;
 use crate::renderer::Renderer;
+use crate::types::GpuLight;
 
 use super::Scene;
 
@@ -113,6 +114,259 @@ fn camera_from_mitsuba(desc: &MitsubaCameraDesc) -> OrbitalCamera {
     cam.camera.near = desc.near;
     cam.camera.far = desc.far;
     cam
+}
+
+// ── Emitter (light / environment) parsing ────────────────────────────────────
+
+/// Parsed Mitsuba emitter.
+enum MitsubaEmitter {
+    Point { position: Vec3, color: Vec3, intensity: f32 },
+    Directional { direction: Vec3, color: Vec3, intensity: f32 },
+    Spot { position: Vec3, direction: Vec3, color: Vec3, intensity: f32, cutoff_angle: f32 },
+    EnvMap { filename: String, scale: f32 },
+    Area { radiance: Vec3 },
+}
+
+/// Parse a `<emitter>` element. Reader is positioned just after `<emitter type="...">`.
+fn parse_emitter(reader: &mut Reader<&[u8]>, emitter_type: &str) -> Result<MitsubaEmitter> {
+    let props = parse_properties(reader, b"emitter")?;
+
+    match emitter_type {
+        "point" => {
+            let position = props.get_point("position").unwrap_or(Vec3::ZERO);
+            let (color, intensity) = props.get_color_intensity("intensity", Vec3::ONE, 1.0);
+            Ok(MitsubaEmitter::Point { position, color, intensity })
+        }
+        "directional" | "distant" => {
+            let direction = props.get_vec3("direction").unwrap_or(Vec3::new(0.0, -1.0, 0.0));
+            let (color, intensity) = props.get_color_intensity("irradiance", Vec3::ONE, 1.0);
+            Ok(MitsubaEmitter::Directional { direction: direction.normalize(), color, intensity })
+        }
+        "spot" => {
+            let position = props.get_point("position").unwrap_or(Vec3::ZERO);
+            let direction = props.get_vec3("direction").unwrap_or(Vec3::new(0.0, -1.0, 0.0));
+            let (color, intensity) = props.get_color_intensity("intensity", Vec3::ONE, 1.0);
+            let cutoff = props.get_float("cutoff_angle").unwrap_or(20.0);
+            Ok(MitsubaEmitter::Spot {
+                position,
+                direction: direction.normalize(),
+                color,
+                intensity,
+                cutoff_angle: cutoff,
+            })
+        }
+        "envmap" => {
+            let filename = props.get_string("filename")
+                .context("<emitter type=\"envmap\"> missing 'filename'")?;
+            let scale = props.get_float("scale").unwrap_or(1.0);
+            Ok(MitsubaEmitter::EnvMap { filename, scale })
+        }
+        "area" => {
+            let (radiance, _) = props.get_color_intensity("radiance", Vec3::ONE, 1.0);
+            Ok(MitsubaEmitter::Area { radiance })
+        }
+        _ => {
+            log::warn!("Unsupported emitter type: {emitter_type}");
+            Ok(MitsubaEmitter::Point { position: Vec3::ZERO, color: Vec3::ONE, intensity: 0.0 })
+        }
+    }
+}
+
+/// Convert Mitsuba emitter to GpuLight.
+fn gpu_light_from_emitter(emitter: &MitsubaEmitter, to_world: &Mat4) -> Option<GpuLight> {
+    match *emitter {
+        MitsubaEmitter::Point { position, color, intensity } => {
+            let world_pos = to_world.transform_point3(position);
+            Some(GpuLight {
+                position_or_direction: [world_pos.x, world_pos.y, world_pos.z, 1.0],
+                color: color.into(),
+                intensity,
+                range: 100.0,
+                ..Default::default()
+            })
+        }
+        MitsubaEmitter::Directional { direction, color, intensity } => {
+            let world_dir = to_world.transform_vector3(direction).normalize();
+            Some(GpuLight {
+                position_or_direction: [world_dir.x, world_dir.y, world_dir.z, 0.0],
+                color: color.into(),
+                intensity,
+                ..Default::default()
+            })
+        }
+        MitsubaEmitter::Spot { position, direction, color, intensity, cutoff_angle } => {
+            let world_pos = to_world.transform_point3(position);
+            let world_dir = to_world.transform_vector3(direction).normalize();
+            let inner = (cutoff_angle * 0.75).to_radians().cos();
+            let outer = cutoff_angle.to_radians().cos();
+            Some(GpuLight {
+                position_or_direction: [world_pos.x, world_pos.y, world_pos.z, 2.0],
+                color: color.into(),
+                intensity,
+                range: 100.0,
+                spot_angles: [inner, outer],
+                ..Default::default()
+            })
+        }
+        MitsubaEmitter::EnvMap { .. } | MitsubaEmitter::Area { .. } => None,
+    }
+}
+
+// ── Property bag (generic Mitsuba property parsing) ──────────────────────────
+
+use std::collections::HashMap;
+
+/// A bag of named Mitsuba properties extracted from an element's children.
+struct Properties {
+    strings: HashMap<String, String>,
+    floats:  HashMap<String, f32>,
+    colors:  HashMap<String, Vec3>,
+    points:  HashMap<String, Vec3>,
+    vectors: HashMap<String, Vec3>,
+    transform: Option<Mat4>,
+}
+
+impl Properties {
+    fn get_string(&self, name: &str) -> Option<String> {
+        self.strings.get(name).cloned()
+    }
+    fn get_float(&self, name: &str) -> Option<f32> {
+        self.floats.get(name).copied()
+    }
+    #[allow(dead_code)]
+    fn get_color(&self, name: &str) -> Option<Vec3> {
+        self.colors.get(name).copied()
+    }
+    fn get_point(&self, name: &str) -> Option<Vec3> {
+        self.points.get(name).copied()
+    }
+    fn get_vec3(&self, name: &str) -> Option<Vec3> {
+        self.vectors.get(name).copied()
+    }
+    #[allow(dead_code)]
+    fn get_transform(&self) -> Option<Mat4> {
+        self.transform
+    }
+
+    /// Get a color+intensity from a named RGB property.
+    /// Mitsuba encodes emitter power as an RGB value where the magnitude is the intensity.
+    fn get_color_intensity(&self, name: &str, default_color: Vec3, default_intensity: f32) -> (Vec3, f32) {
+        if let Some(rgb) = self.colors.get(name) {
+            let max = rgb.x.max(rgb.y).max(rgb.z);
+            if max > 0.0 {
+                (*rgb / max, max)
+            } else {
+                (default_color, 0.0)
+            }
+        } else {
+            (default_color, default_intensity)
+        }
+    }
+}
+
+/// Parse all child property elements until the closing tag with `end_tag` name.
+fn parse_properties(reader: &mut Reader<&[u8]>, end_tag: &[u8]) -> Result<Properties> {
+    let mut props = Properties {
+        strings: HashMap::new(),
+        floats: HashMap::new(),
+        colors: HashMap::new(),
+        points: HashMap::new(),
+        vectors: HashMap::new(),
+        transform: None,
+    };
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf).context("parse_properties")? {
+            Event::Empty(ref e) => {
+                parse_property_element(e, &mut props);
+            }
+            Event::Start(ref e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "transform" => {
+                        props.transform = Some(parse_transform(reader)?);
+                    }
+                    _ => {
+                        // Skip unknown nested elements
+                        let end = e.to_end().into_owned();
+                        let mut skip_buf = Vec::new();
+                        reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                    }
+                }
+            }
+            Event::End(ref e) if e.name().as_ref() == end_tag => break,
+            Event::Eof => anyhow::bail!("unexpected EOF inside <{}>", String::from_utf8_lossy(end_tag)),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(props)
+}
+
+/// Parse a single empty property element like `<float name="x" value="1.0"/>`.
+fn parse_property_element(e: &quick_xml::events::BytesStart, props: &mut Properties) {
+    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+    let name = match attr_str(e, "name") {
+        Some(n) => n,
+        None => return,
+    };
+
+    match tag.as_str() {
+        "string" => {
+            if let Some(v) = attr_str(e, "value") {
+                props.strings.insert(name, v);
+            }
+        }
+        "float" | "integer" => {
+            if let Some(v) = attr_f32(e, "value") {
+                props.floats.insert(name, v);
+            }
+        }
+        "rgb" | "color" | "spectrum" => {
+            if let Some(v) = attr_str(e, "value") {
+                if let Ok(c) = parse_rgb_value(&v) {
+                    props.colors.insert(name, c);
+                }
+            }
+        }
+        "point" => {
+            if let (Some(x), Some(y), Some(z)) = (attr_f32(e, "x"), attr_f32(e, "y"), attr_f32(e, "z")) {
+                props.points.insert(name, Vec3::new(x, y, z));
+            } else if let Some(v) = attr_str(e, "value") {
+                if let Ok(p) = parse_vec3(&v) {
+                    props.points.insert(name, p);
+                }
+            }
+        }
+        "vector" => {
+            if let (Some(x), Some(y), Some(z)) = (attr_f32(e, "x"), attr_f32(e, "y"), attr_f32(e, "z")) {
+                props.vectors.insert(name, Vec3::new(x, y, z));
+            } else if let Some(v) = attr_str(e, "value") {
+                if let Ok(p) = parse_vec3(&v) {
+                    props.vectors.insert(name, p);
+                }
+            }
+        }
+        "boolean" => {
+            if let Some(v) = attr_str(e, "value") {
+                let b = v == "true" || v == "1";
+                props.floats.insert(name, if b { 1.0 } else { 0.0 });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse an RGB color value string. Supports "r, g, b" or "r g b" or single value.
+fn parse_rgb_value(s: &str) -> Result<Vec3> {
+    let v = parse_floats(s);
+    match v.len() {
+        1 => Ok(Vec3::splat(v[0])),
+        3 => Ok(Vec3::new(v[0], v[1], v[2])),
+        n => anyhow::bail!("expected 1 or 3 components for RGB, got {n}: '{s}'"),
+    }
 }
 
 // ── XML helpers ──────────────────────────────────────────────────────────────
@@ -402,6 +656,81 @@ mod tests {
         assert!((pos.x).abs() < 0.5, "x={}", pos.x);
         assert!((pos.y - 5.0).abs() < 0.5, "y={}", pos.y);
         assert!((pos.z - 10.0).abs() < 0.5, "z={}", pos.z);
+    }
+
+    fn parse_emitter_str(xml: &str, emitter_type: &str) -> Result<MitsubaEmitter> {
+        let full = format!("<emitter type=\"{emitter_type}\">{xml}</emitter>");
+        let mut reader = Reader::from_str(&full);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf)? {
+                Event::Start(ref e) if e.name().as_ref() == b"emitter" => break,
+                Event::Eof => anyhow::bail!("no <emitter> found"),
+                _ => {}
+            }
+            buf.clear();
+        }
+        parse_emitter(&mut reader, emitter_type)
+    }
+
+    #[test]
+    fn test_point_light() {
+        let e = parse_emitter_str(r#"
+            <point name="position" x="1" y="2" z="3"/>
+            <rgb name="intensity" value="100, 50, 50"/>
+        "#, "point").unwrap();
+        match e {
+            MitsubaEmitter::Point { position, color, intensity } => {
+                assert!((position.x - 1.0).abs() < 1e-6);
+                assert!((position.y - 2.0).abs() < 1e-6);
+                assert!((position.z - 3.0).abs() < 1e-6);
+                assert!(intensity > 0.0);
+                assert!(color.x >= color.y); // red dominant
+            }
+            _ => panic!("expected Point emitter"),
+        }
+    }
+
+    #[test]
+    fn test_directional_light() {
+        let e = parse_emitter_str(r#"
+            <vector name="direction" x="0" y="-1" z="0"/>
+            <rgb name="irradiance" value="3, 3, 3"/>
+        "#, "directional").unwrap();
+        match e {
+            MitsubaEmitter::Directional { direction, .. } => {
+                assert!((direction.y - (-1.0)).abs() < 1e-6);
+            }
+            _ => panic!("expected Directional emitter"),
+        }
+    }
+
+    #[test]
+    fn test_envmap_emitter() {
+        let e = parse_emitter_str(r#"
+            <string name="filename" value="textures/env.exr"/>
+            <float name="scale" value="0.5"/>
+        "#, "envmap").unwrap();
+        match e {
+            MitsubaEmitter::EnvMap { filename, scale } => {
+                assert_eq!(filename, "textures/env.exr");
+                assert!((scale - 0.5).abs() < 1e-6);
+            }
+            _ => panic!("expected EnvMap emitter"),
+        }
+    }
+
+    #[test]
+    fn test_gpu_light_from_point() {
+        let emitter = MitsubaEmitter::Point {
+            position: Vec3::new(1.0, 2.0, 3.0),
+            color: Vec3::ONE,
+            intensity: 10.0,
+        };
+        let light = gpu_light_from_emitter(&emitter, &Mat4::IDENTITY).unwrap();
+        assert!((light.position_or_direction[0] - 1.0).abs() < 1e-6);
+        assert!((light.position_or_direction[3] - 1.0).abs() < 1e-6); // w=1 for point
+        assert!((light.intensity - 10.0).abs() < 1e-6);
     }
 
     #[test]
