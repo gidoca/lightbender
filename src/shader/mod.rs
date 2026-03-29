@@ -75,3 +75,54 @@ pub fn load_spirv(path: &Path) -> Result<Vec<u32>> {
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f
+    }
+
+    fn spirv_magic_le() -> [u8; 4] {
+        0x07230203u32.to_le_bytes()
+    }
+
+    #[test]
+    fn load_spirv_valid() {
+        // Minimal valid SPIR-V: magic + 7 more u32s (version, generator, bound, 0, 0, opcode...)
+        let mut bytes = spirv_magic_le().to_vec();
+        bytes.extend_from_slice(&[0u8; 28]); // 7 more u32s
+        let f = write_temp(&bytes);
+        let words = load_spirv(f.path()).unwrap();
+        assert_eq!(words[0], 0x07230203);
+        assert_eq!(words.len(), 8);
+    }
+
+    #[test]
+    fn load_spirv_wrong_magic() {
+        let bytes = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00];
+        let f = write_temp(&bytes);
+        let err = load_spirv(f.path()).unwrap_err();
+        assert!(err.to_string().contains("magic"), "{}", err);
+    }
+
+    #[test]
+    fn load_spirv_misaligned() {
+        let mut bytes = spirv_magic_le().to_vec();
+        bytes.push(0x00); // 5 bytes total — not 4-byte aligned
+        let f = write_temp(&bytes);
+        let err = load_spirv(f.path()).unwrap_err();
+        assert!(err.to_string().contains("4-byte"), "{}", err);
+    }
+
+    #[test]
+    fn load_spirv_missing_file() {
+        let err = load_spirv(Path::new("/nonexistent/path/shader.spv")).unwrap_err();
+        assert!(err.to_string().contains("read SPIR-V"), "{}", err);
+    }
+}
