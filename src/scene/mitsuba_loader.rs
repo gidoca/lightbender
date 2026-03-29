@@ -212,6 +212,176 @@ fn gpu_light_from_emitter(emitter: &MitsubaEmitter, to_world: &Mat4) -> Option<G
     }
 }
 
+// ── BSDF (material) parsing ──────────────────────────────────────────────────
+
+/// Parsed Mitsuba BSDF mapped to PBR parameters.
+#[derive(Clone, Debug)]
+struct MitsubaMaterial {
+    base_color:    Vec3,
+    metallic:      f32,
+    roughness:     f32,
+    emissive:      Vec3,
+    double_sided:  bool,
+    base_color_texture: Option<String>, // path to bitmap texture
+}
+
+impl Default for MitsubaMaterial {
+    fn default() -> Self {
+        Self {
+            base_color:    Vec3::new(0.5, 0.5, 0.5),
+            metallic:      0.0,
+            roughness:     1.0,
+            emissive:      Vec3::ZERO,
+            double_sided:  false,
+            base_color_texture: None,
+        }
+    }
+}
+
+/// Parse a `<bsdf>` element. Reader positioned just after `<bsdf type="...">`.
+/// Returns the material and optionally its `id` for reference resolution.
+fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMaterial> {
+    let mut mat = MitsubaMaterial::default();
+    let mut buf = Vec::new();
+    let mut inner_bsdf: Option<MitsubaMaterial> = None;
+    let mut skip_buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf).context("parse_bsdf")? {
+            Event::Empty(ref e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                handle_bsdf_property(e, &tag, &mut mat);
+            }
+            Event::Start(ref e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "bsdf" => {
+                        let inner_type = attr_str(e, "type").unwrap_or_default();
+                        inner_bsdf = Some(parse_bsdf(reader, &inner_type)?);
+                    }
+                    "texture" => {
+                        let tex_type = attr_str(e, "type").unwrap_or_default();
+                        let tex_name = attr_str(e, "name").unwrap_or_default();
+                        if tex_type == "bitmap" {
+                            let tex_props = parse_properties(reader, b"texture")?;
+                            if let Some(filename) = tex_props.get_string("filename") {
+                                if tex_name == "reflectance" || tex_name == "diffuse_reflectance" || tex_name == "base_color" {
+                                    mat.base_color_texture = Some(filename);
+                                }
+                            }
+                        } else {
+                            let end = e.to_end().into_owned();
+                            reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                            skip_buf.clear();
+                        }
+                    }
+                    _ => {
+                        let end = e.to_end().into_owned();
+                        reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                        skip_buf.clear();
+                    }
+                }
+            }
+            Event::End(ref e) if e.name().as_ref() == b"bsdf" => break,
+            Event::Eof => anyhow::bail!("unexpected EOF inside <bsdf>"),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    // Apply BSDF-type-specific mapping
+    apply_bsdf_type_mapping(&mut mat, bsdf_type);
+
+    // Handle twosided: inherit from inner BSDF
+    if bsdf_type == "twosided" {
+        if let Some(inner) = inner_bsdf {
+            mat.base_color = inner.base_color;
+            mat.metallic = inner.metallic;
+            mat.roughness = inner.roughness;
+            mat.emissive = inner.emissive;
+            mat.base_color_texture = inner.base_color_texture;
+        }
+        mat.double_sided = true;
+    }
+
+    Ok(mat)
+}
+
+/// Handle a single property element inside a BSDF.
+fn handle_bsdf_property(e: &quick_xml::events::BytesStart, tag: &str, mat: &mut MitsubaMaterial) {
+    let name = match attr_str(e, "name") {
+        Some(n) => n,
+        None => return,
+    };
+
+    match tag {
+        "rgb" | "color" | "spectrum" => {
+            if let Some(v) = attr_str(e, "value") {
+                if let Ok(c) = parse_rgb_value(&v) {
+                    match name.as_str() {
+                        "reflectance" | "diffuse_reflectance" | "base_color" => mat.base_color = c,
+                        "specular_reflectance" => {} // handled in type mapping
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "float" => {
+            if let Some(v) = attr_f32(e, "value") {
+                match name.as_str() {
+                    "alpha" => mat.roughness = v,
+                    _ => {}
+                }
+            }
+        }
+        "string" => {
+            // 'material' name for conductors handled in type mapping
+        }
+        _ => {}
+    }
+}
+
+/// Apply BSDF type-specific PBR parameter overrides.
+fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
+    match bsdf_type {
+        "diffuse" => {
+            mat.metallic = 0.0;
+            mat.roughness = 1.0;
+        }
+        "roughplastic" => {
+            mat.metallic = 0.0;
+            // roughness already set from 'alpha'
+        }
+        "plastic" => {
+            mat.metallic = 0.0;
+            mat.roughness = 0.1;
+        }
+        "roughconductor" => {
+            mat.metallic = 1.0;
+            // roughness from 'alpha', base_color from material name (later step)
+        }
+        "conductor" => {
+            mat.metallic = 1.0;
+            mat.roughness = 0.01;
+        }
+        "dielectric" | "roughdielectric" | "thindielectric" => {
+            mat.metallic = 0.0;
+            if bsdf_type == "dielectric" || bsdf_type == "thindielectric" {
+                mat.roughness = 0.0;
+            }
+            // Transparency will be handled in Phase 2
+        }
+        "twosided" => {
+            // Handled after inner BSDF is parsed
+        }
+        _ => {
+            if bsdf_type != "null" && bsdf_type != "mask" && bsdf_type != "blendbsdf" {
+                log::warn!("Unsupported BSDF type '{bsdf_type}', using default gray diffuse");
+            }
+        }
+    }
+}
+
 // ── Property bag (generic Mitsuba property parsing) ──────────────────────────
 
 use std::collections::HashMap;
@@ -656,6 +826,71 @@ mod tests {
         assert!((pos.x).abs() < 0.5, "x={}", pos.x);
         assert!((pos.y - 5.0).abs() < 0.5, "y={}", pos.y);
         assert!((pos.z - 10.0).abs() < 0.5, "z={}", pos.z);
+    }
+
+    fn parse_bsdf_str(xml: &str, bsdf_type: &str) -> Result<MitsubaMaterial> {
+        let full = format!("<bsdf type=\"{bsdf_type}\">{xml}</bsdf>");
+        let mut reader = Reader::from_str(&full);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf)? {
+                Event::Start(ref e) if e.name().as_ref() == b"bsdf" => break,
+                Event::Eof => anyhow::bail!("no <bsdf> found"),
+                _ => {}
+            }
+            buf.clear();
+        }
+        parse_bsdf(&mut reader, bsdf_type)
+    }
+
+    #[test]
+    fn test_diffuse_bsdf() {
+        let m = parse_bsdf_str(r#"
+            <rgb name="reflectance" value="0.8, 0.2, 0.1"/>
+        "#, "diffuse").unwrap();
+        assert!((m.base_color.x - 0.8).abs() < 1e-6);
+        assert!((m.base_color.y - 0.2).abs() < 1e-6);
+        assert!((m.metallic).abs() < 1e-6);
+        assert!((m.roughness - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_roughplastic_bsdf() {
+        let m = parse_bsdf_str(r#"
+            <rgb name="diffuse_reflectance" value="0.3, 0.5, 0.3"/>
+            <float name="alpha" value="0.1"/>
+        "#, "roughplastic").unwrap();
+        assert!((m.base_color.y - 0.5).abs() < 1e-6);
+        assert!((m.roughness - 0.1).abs() < 1e-6);
+        assert!((m.metallic).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_conductor_bsdf() {
+        let m = parse_bsdf_str(r#""#, "conductor").unwrap();
+        assert!((m.metallic - 1.0).abs() < 1e-6);
+        assert!(m.roughness < 0.05);
+    }
+
+    #[test]
+    fn test_twosided_bsdf() {
+        let m = parse_bsdf_str(r#"
+            <bsdf type="diffuse">
+                <rgb name="reflectance" value="0.9, 0.1, 0.1"/>
+            </bsdf>
+        "#, "twosided").unwrap();
+        assert!(m.double_sided);
+        assert!((m.base_color.x - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bsdf_with_texture() {
+        let m = parse_bsdf_str(r#"
+            <texture type="bitmap" name="reflectance">
+                <string name="filename" value="textures/wood.jpg"/>
+            </texture>
+        "#, "diffuse").unwrap();
+        assert_eq!(m.base_color_texture.as_deref(), Some("textures/wood.jpg"));
     }
 
     fn parse_emitter_str(xml: &str, emitter_type: &str) -> Result<MitsubaEmitter> {
