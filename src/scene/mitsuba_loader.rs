@@ -411,14 +411,14 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
         match reader.read_event_into(&mut buf).context("parse_sensor")? {
             Event::Empty(ref e) => {
                 let tag = e.name();
-                if tag.as_ref() == b"float" {
-                    if let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value")) {
-                        match name.as_str() {
-                            "fov" => desc.fov_y = val,
-                            "near_clip" => desc.near = val,
-                            "far_clip" => desc.far = val,
-                            _ => {}
-                        }
+                if tag.as_ref() == b"float"
+                    && let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value"))
+                {
+                    match name.as_str() {
+                        "fov" => desc.fov_y = val,
+                        "near_clip" => desc.near = val,
+                        "far_clip" => desc.far = val,
+                        _ => {}
                     }
                 }
             }
@@ -607,17 +607,17 @@ fn parse_shape(reader: &mut Reader<&[u8]>, shape_type: &str, base_dir: &Path) ->
                         }
                     }
                     "float" => {
-                        if let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value")) {
-                            if name == "radius" {
-                                radius = val;
-                            }
+                        if let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value"))
+                            && name == "radius"
+                        {
+                            radius = val;
                         }
                     }
                     "point" => {
-                        if attr_str(e, "name").as_deref() == Some("center") {
-                            if let (Some(x), Some(y), Some(z)) = (attr_f32(e, "x"), attr_f32(e, "y"), attr_f32(e, "z")) {
-                                center = Vec3::new(x, y, z);
-                            }
+                        if attr_str(e, "name").as_deref() == Some("center")
+                            && let (Some(x), Some(y), Some(z)) = (attr_f32(e, "x"), attr_f32(e, "y"), attr_f32(e, "z"))
+                        {
+                            center = Vec3::new(x, y, z);
                         }
                     }
                     "boolean" => {
@@ -933,10 +933,10 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
                         let tex_name = attr_str(e, "name").unwrap_or_default();
                         if tex_type == "bitmap" {
                             let tex_props = parse_properties(reader, b"texture")?;
-                            if let Some(filename) = tex_props.get_string("filename") {
-                                if tex_name == "reflectance" || tex_name == "diffuse_reflectance" || tex_name == "base_color" {
-                                    mat.base_color_texture = Some(filename);
-                                }
+                            if let Some(filename) = tex_props.get_string("filename")
+                                && (tex_name == "reflectance" || tex_name == "diffuse_reflectance" || tex_name == "base_color")
+                            {
+                                mat.base_color_texture = Some(filename);
                             }
                         } else {
                             let end = e.to_end().into_owned();
@@ -985,21 +985,21 @@ fn handle_bsdf_property(e: &quick_xml::events::BytesStart, tag: &str, mat: &mut 
 
     match tag {
         "rgb" | "color" | "spectrum" => {
-            if let Some(v) = attr_str(e, "value") {
-                if let Ok(c) = parse_rgb_value(&v) {
-                    match name.as_str() {
-                        "reflectance" | "diffuse_reflectance" | "base_color" => mat.base_color = c,
-                        "specular_reflectance" => {} // handled in type mapping
-                        _ => {}
-                    }
+            if let Some(v) = attr_str(e, "value")
+                && let Ok(c) = parse_rgb_value(&v)
+            {
+                match name.as_str() {
+                    "reflectance" | "diffuse_reflectance" | "base_color" => mat.base_color = c,
+                    "specular_reflectance" => {} // handled in type mapping
+                    _ => {}
                 }
             }
         }
         "float" => {
-            if let Some(v) = attr_f32(e, "value") {
-                if name == "alpha" {
-                    mat.roughness = v;
-                }
+            if let Some(v) = attr_f32(e, "value")
+                && name == "alpha"
+            {
+                mat.roughness = v;
             }
         }
         "string" => {
@@ -1163,28 +1163,28 @@ fn parse_property_element(e: &quick_xml::events::BytesStart, props: &mut Propert
             }
         }
         "rgb" | "color" | "spectrum" => {
-            if let Some(v) = attr_str(e, "value") {
-                if let Ok(c) = parse_rgb_value(&v) {
-                    props.colors.insert(name, c);
-                }
+            if let Some(v) = attr_str(e, "value")
+                && let Ok(c) = parse_rgb_value(&v)
+            {
+                props.colors.insert(name, c);
             }
         }
         "point" => {
             if let (Some(x), Some(y), Some(z)) = (attr_f32(e, "x"), attr_f32(e, "y"), attr_f32(e, "z")) {
                 props.points.insert(name, Vec3::new(x, y, z));
-            } else if let Some(v) = attr_str(e, "value") {
-                if let Ok(p) = parse_vec3(&v) {
-                    props.points.insert(name, p);
-                }
+            } else if let Some(v) = attr_str(e, "value")
+                && let Ok(p) = parse_vec3(&v)
+            {
+                props.points.insert(name, p);
             }
         }
         "vector" => {
             if let (Some(x), Some(y), Some(z)) = (attr_f32(e, "x"), attr_f32(e, "y"), attr_f32(e, "z")) {
                 props.vectors.insert(name, Vec3::new(x, y, z));
-            } else if let Some(v) = attr_str(e, "value") {
-                if let Ok(p) = parse_vec3(&v) {
-                    props.vectors.insert(name, p);
-                }
+            } else if let Some(v) = attr_str(e, "value")
+                && let Ok(p) = parse_vec3(&v)
+            {
+                props.vectors.insert(name, p);
             }
         }
         "boolean" => {

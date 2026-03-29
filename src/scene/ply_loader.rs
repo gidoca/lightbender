@@ -62,11 +62,11 @@ pub fn load_ply(path: &Path) -> Result<PlyMesh> {
                     .context("read PLY faces")?;
 
                 for elem in &elems {
-                    if let Some(Property::ListInt(ref list)) = elem.get("vertex_indices")
+                    if let Some(Property::ListInt(list)) = elem.get("vertex_indices")
                         .or_else(|| elem.get("vertex_index"))
                     {
                         triangulate_face(list, &mut face_indices);
-                    } else if let Some(Property::ListUInt(ref list)) = elem.get("vertex_indices")
+                    } else if let Some(Property::ListUInt(list)) = elem.get("vertex_indices")
                         .or_else(|| elem.get("vertex_index"))
                     {
                         let signed: Vec<i32> = list.iter().map(|&v| v as i32).collect();
