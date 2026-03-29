@@ -13,13 +13,14 @@ use winit::{
 use crate::camera::OrbitalCamera;
 use crate::input::InputState;
 use crate::renderer::Renderer;
-use crate::scene::{gltf_loader, loader, GpuTexture, Scene};
+use crate::scene::{gltf_loader, loader, mitsuba_loader, GpuTexture, Scene};
 use crate::shader::ShaderLibrary;
 use crate::vulkan::image::{load_hdr_to_rgba32f, GpuImage};
 
 pub enum InputPath {
     Model(PathBuf),
     Scene(PathBuf),
+    MitsubaScene(PathBuf),
 }
 
 pub struct App {
@@ -151,6 +152,16 @@ pub fn load_scene_from_input(
                     Some(loaded.scene)
                 }
                 Err(e) => { log::error!("Failed to load scene: {e:#}"); None }
+            }
+        }
+        Some(InputPath::MitsubaScene(path)) => {
+            match mitsuba_loader::load_mitsuba(renderer, path) {
+                Ok(loaded) => {
+                    camera = loaded.camera;
+                    log::info!("Loaded Mitsuba scene: {}", path.display());
+                    Some(loaded.scene)
+                }
+                Err(e) => { log::error!("Failed to load Mitsuba scene: {e:#}"); None }
             }
         }
         None => None,
