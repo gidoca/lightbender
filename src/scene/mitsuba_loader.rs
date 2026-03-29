@@ -1,31 +1,385 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use glam::{Mat4, Vec3};
+use ash::vk;
+use glam::{Mat4, Quat, Vec3};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use crate::camera::OrbitalCamera;
 use crate::renderer::Renderer;
 use crate::types::GpuLight;
+use crate::vulkan::buffer::upload_to_device_local;
+use crate::vulkan::image::GpuImage;
 
-use super::Scene;
+use super::{
+    GpuMaterial, GpuMesh, GpuPrimitive, GpuTexture, Scene, SceneNode, Transform,
+};
 
 pub struct LoadedMitsubaScene {
-    pub scene:  Scene,
-    pub camera: OrbitalCamera,
+    pub scene:       Scene,
+    pub camera:      OrbitalCamera,
+    pub lights:      Vec<GpuLight>,
+    pub env_map:     Option<String>,  // path to environment map
+    pub env_scale:   f32,
 }
 
-pub fn load_mitsuba(_renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaScene> {
+pub fn load_mitsuba(renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaScene> {
     let xml = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read Mitsuba XML: {}: {e}", path.display()))?;
 
-    let reader = Reader::from_str(&xml);
-    let _ = reader;
+    let base_dir = path.parent().unwrap_or(Path::new("."));
 
-    log::info!("Found Mitsuba scene: {}", path.display());
+    // ── Phase 1: Parse XML ───────────────────────────────────────────────────
+    let mut reader = Reader::from_str(&xml);
+    let mut buf = Vec::new();
+    let mut skip_buf = Vec::new();
 
-    anyhow::bail!("Mitsuba scene loading not yet implemented")
+    let mut camera_desc: Option<MitsubaCameraDesc> = None;
+    let mut shapes: Vec<MitsubaShape> = Vec::new();
+    let mut emitters: Vec<(MitsubaEmitter, Mat4)> = Vec::new();
+    let mut named_bsdfs: HashMap<String, MitsubaMaterial> = HashMap::new();
+
+    loop {
+        match reader.read_event_into(&mut buf).context("parse scene")? {
+            Event::Start(ref e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "sensor" => {
+                        camera_desc = Some(parse_sensor(&mut reader)?);
+                    }
+                    "shape" => {
+                        let shape_type = attr_str(e, "type").unwrap_or_default();
+                        match parse_shape(&mut reader, &shape_type, base_dir) {
+                            Ok(shape) => shapes.push(shape),
+                            Err(err) => log::error!("Failed to parse shape: {err:#}"),
+                        }
+                    }
+                    "emitter" => {
+                        let emitter_type = attr_str(e, "type").unwrap_or_default();
+                        match parse_emitter(&mut reader, &emitter_type) {
+                            Ok(em) => emitters.push((em, Mat4::IDENTITY)),
+                            Err(err) => log::error!("Failed to parse emitter: {err:#}"),
+                        }
+                    }
+                    "bsdf" => {
+                        let bsdf_type = attr_str(e, "type").unwrap_or_default();
+                        let bsdf_id = attr_str(e, "id");
+                        match parse_bsdf(&mut reader, &bsdf_type) {
+                            Ok(mat) => {
+                                if let Some(id) = bsdf_id {
+                                    named_bsdfs.insert(id, mat);
+                                }
+                            }
+                            Err(err) => log::error!("Failed to parse BSDF: {err:#}"),
+                        }
+                    }
+                    "scene" => {
+                        // Continue into scene children
+                    }
+                    _ => {
+                        // Skip integrator, sampler, etc.
+                        let end = e.to_end().into_owned();
+                        reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                        skip_buf.clear();
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    log::info!(
+        "Parsed Mitsuba scene: {} shapes, {} emitters, {} named BSDFs",
+        shapes.len(), emitters.len(), named_bsdfs.len()
+    );
+
+    // ── Phase 2: Upload GPU resources ────────────────────────────────────────
+    let ctx = renderer.load_context();
+
+    // Create placeholder textures
+    let make_placeholder = |pixels: [u8; 4]| -> Result<GpuTexture> {
+        let img = unsafe {
+            GpuImage::upload_rgba8(
+                ctx.device, ctx.instance, ctx.physical_device,
+                ctx.command_pool, ctx.queue, 1, 1, &pixels,
+            )?
+        };
+        let sampler = unsafe {
+            ctx.device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_w(vk::SamplerAddressMode::REPEAT),
+                None,
+            )?
+        };
+        Ok(GpuTexture { image: img, sampler })
+    };
+
+    let white_tex = make_placeholder([255, 255, 255, 255])?;
+    let flat_normal_tex = make_placeholder([128, 128, 255, 255])?;
+    let mr_placeholder = make_placeholder([0, 128, 0, 255])?;
+    let black_tex = make_placeholder([0, 0, 0, 255])?;
+
+    let mut textures: Vec<GpuTexture> = Vec::new();
+    let mut texture_index_cache: HashMap<String, usize> = HashMap::new();
+
+    // Helper: load a texture file and return its index
+    let load_texture = |path: &Path, textures: &mut Vec<GpuTexture>, cache: &mut HashMap<String, usize>| -> Result<usize> {
+        let key = path.to_string_lossy().to_string();
+        if let Some(&idx) = cache.get(&key) {
+            return Ok(idx);
+        }
+
+        let img = image::open(path)
+            .with_context(|| format!("load texture: {}", path.display()))?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+
+        let gpu_img = unsafe {
+            GpuImage::upload_rgba8(
+                ctx.device, ctx.instance, ctx.physical_device,
+                ctx.command_pool, ctx.queue, w, h, &rgba,
+            )?
+        };
+
+        let sampler = unsafe {
+            ctx.device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                    .max_lod(vk::LOD_CLAMP_NONE)
+                    .max_anisotropy(1.0),
+                None,
+            )?
+        };
+
+        let idx = textures.len();
+        textures.push(GpuTexture { image: gpu_img, sampler });
+        cache.insert(key, idx);
+        Ok(idx)
+    };
+
+    // Descriptor pool for materials
+    let mat_count = shapes.len().max(1) as u32;
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: mat_count * 5,
+    }];
+    let descriptor_pool = unsafe {
+        ctx.device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .pool_sizes(&pool_sizes)
+                .max_sets(mat_count),
+            None,
+        )?
+    };
+
+    let alloc_descriptor_set = || -> Result<vk::DescriptorSet> {
+        let layouts = [ctx.material_set_layout];
+        Ok(unsafe {
+            ctx.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )?
+        }[0])
+    };
+
+    // ── Build scene from shapes ──────────────────────────────────────────────
+    let mut materials: Vec<GpuMaterial> = Vec::new();
+    let mut meshes: Vec<GpuMesh> = Vec::new();
+    let mut nodes: Vec<SceneNode> = Vec::new();
+    let mut gpu_lights: Vec<GpuLight> = Vec::new();
+
+    for (i, shape) in shapes.iter().enumerate() {
+        if shape.vertices.is_empty() || shape.indices.is_empty() {
+            continue;
+        }
+
+        // Resolve material
+        let mat_desc = if let Some(ref mat) = shape.material {
+            mat.clone()
+        } else if let Some(ref ref_id) = shape.material_ref {
+            named_bsdfs.get(ref_id).cloned().unwrap_or_else(|| {
+                log::warn!("BSDF ref '{ref_id}' not found, using default");
+                MitsubaMaterial::default()
+            })
+        } else {
+            MitsubaMaterial::default()
+        };
+
+        // Load base color texture if referenced
+        let bc_tex_idx = if let Some(ref tex_path) = mat_desc.base_color_texture {
+            let resolved = resolve_path(base_dir, tex_path);
+            match load_texture(&resolved, &mut textures, &mut texture_index_cache) {
+                Ok(idx) => Some(idx),
+                Err(e) => {
+                    log::error!("Failed to load texture {}: {e:#}", resolved.display());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Handle area emitters -> emissive factor
+        let mut emissive = mat_desc.emissive;
+        if let Some(MitsubaEmitter::Area { radiance }) = &shape.area_emitter {
+            emissive = *radiance;
+        }
+
+        // Create material
+        let ds = alloc_descriptor_set()?;
+
+        let tex_or = |idx: Option<usize>, fallback: &GpuTexture| -> (vk::ImageView, vk::Sampler) {
+            idx.map(|i| (textures[i].image.view, textures[i].sampler))
+               .unwrap_or((fallback.image.view, fallback.sampler))
+        };
+
+        let (bc_view, bc_samp) = tex_or(bc_tex_idx, &white_tex);
+        let (nm_view, nm_samp) = (flat_normal_tex.image.view, flat_normal_tex.sampler);
+        let (mr_view, mr_samp) = (mr_placeholder.image.view, mr_placeholder.sampler);
+        let (oc_view, oc_samp) = (white_tex.image.view, white_tex.sampler);
+        let (em_view, em_samp) = (black_tex.image.view, black_tex.sampler);
+
+        let image_infos = [
+            vk::DescriptorImageInfo { image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, image_view: bc_view, sampler: bc_samp },
+            vk::DescriptorImageInfo { image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, image_view: nm_view, sampler: nm_samp },
+            vk::DescriptorImageInfo { image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, image_view: mr_view, sampler: mr_samp },
+            vk::DescriptorImageInfo { image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, image_view: oc_view, sampler: oc_samp },
+            vk::DescriptorImageInfo { image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, image_view: em_view, sampler: em_samp },
+        ];
+
+        let writes: Vec<vk::WriteDescriptorSet> = image_infos.iter().enumerate().map(|(binding, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(binding as u32)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(info))
+        }).collect();
+        unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+
+        let mat_idx = materials.len();
+        materials.push(GpuMaterial {
+            base_color_factor:          [mat_desc.base_color.x, mat_desc.base_color.y, mat_desc.base_color.z, 1.0],
+            metallic_factor:            mat_desc.metallic,
+            roughness_factor:           mat_desc.roughness,
+            emissive_factor:            [emissive.x, emissive.y, emissive.z],
+            base_color_texture:         bc_tex_idx,
+            normal_texture:             None,
+            metallic_roughness_texture: None,
+            occlusion_texture:          None,
+            emissive_texture:           None,
+            double_sided:               mat_desc.double_sided,
+            pipeline_name:              None,
+            descriptor_set:             ds,
+        });
+
+        // Upload vertex/index buffers
+        let vertex_buffer = unsafe {
+            upload_to_device_local(
+                ctx.device, ctx.instance, ctx.physical_device,
+                ctx.command_pool, ctx.queue,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                &shape.vertices,
+            )?
+        };
+        let index_buffer = unsafe {
+            upload_to_device_local(
+                ctx.device, ctx.instance, ctx.physical_device,
+                ctx.command_pool, ctx.queue,
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                &shape.indices,
+            )?
+        };
+
+        let mesh_idx = meshes.len();
+        meshes.push(GpuMesh {
+            name: format!("shape_{i}"),
+            primitives: vec![GpuPrimitive {
+                vertex_buffer,
+                index_buffer,
+                index_count: shape.indices.len() as u32,
+                material: mat_idx,
+            }],
+        });
+
+        // Decompose to_world into Transform for the scene node
+        let (scale, rotation, translation) = shape.to_world.to_scale_rotation_translation();
+        nodes.push(SceneNode {
+            name: format!("shape_{i}"),
+            local_transform: Transform { translation, rotation, scale },
+            parent: None,
+            children: Vec::new(),
+            mesh: Some(mesh_idx),
+        });
+
+        // Area emitter -> point light proxy at centroid
+        if let Some(MitsubaEmitter::Area { radiance }) = &shape.area_emitter {
+            let centroid = shape.to_world.transform_point3(Vec3::ZERO);
+            let max_r = radiance.x.max(radiance.y).max(radiance.z);
+            if max_r > 0.0 {
+                gpu_lights.push(GpuLight {
+                    position_or_direction: [centroid.x, centroid.y, centroid.z, 1.0],
+                    color: [radiance.x / max_r, radiance.y / max_r, radiance.z / max_r],
+                    intensity: max_r,
+                    range: 100.0,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // Add placeholder textures to list for cleanup
+    textures.push(white_tex);
+    textures.push(flat_normal_tex);
+    textures.push(mr_placeholder);
+    textures.push(black_tex);
+
+    // Convert emitters to GPU lights
+    for (emitter, to_world) in &emitters {
+        if let Some(light) = gpu_light_from_emitter(emitter, to_world) {
+            gpu_lights.push(light);
+        }
+    }
+
+    // Find environment map
+    let mut env_map = None;
+    let mut env_scale = 1.0f32;
+    for (emitter, _) in &emitters {
+        if let MitsubaEmitter::EnvMap { filename, scale } = emitter {
+            env_map = Some(resolve_path(base_dir, filename).to_string_lossy().to_string());
+            env_scale = *scale;
+        }
+    }
+
+    // Camera
+    let camera = camera_desc
+        .map(|d| camera_from_mitsuba(&d))
+        .unwrap_or_else(|| OrbitalCamera::new(Vec3::ZERO, 5.0, 30.0, 20.0));
+
+    // Build scene
+    let node_count = nodes.len();
+    let mut scene = Scene {
+        nodes,
+        meshes,
+        materials,
+        textures,
+        world_transforms: vec![Mat4::IDENTITY; node_count],
+        descriptor_pool,
+    };
+    scene.update_world_transforms();
+
+    Ok(LoadedMitsubaScene { scene, camera, lights: gpu_lights, env_map, env_scale })
 }
 
 // ── Sensor (camera) parsing ──────────────────────────────────────────────────

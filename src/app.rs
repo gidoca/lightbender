@@ -158,7 +158,26 @@ pub fn load_scene_from_input(
             match mitsuba_loader::load_mitsuba(renderer, path) {
                 Ok(loaded) => {
                     camera = loaded.camera;
-                    log::info!("Loaded Mitsuba scene: {}", path.display());
+
+                    // Load environment map if present
+                    if let Some(ref map_path) = loaded.env_map {
+                        let resolved = std::path::PathBuf::from(map_path);
+                        match load_and_upload_env_map(renderer, &resolved) {
+                            Ok(tex) => {
+                                if let Err(e) = renderer.set_environment_map(tex, loaded.env_scale) {
+                                    log::error!("Failed to set env map: {e:#}");
+                                } else {
+                                    log::info!("Loaded environment map: {} (intensity={})", resolved.display(), loaded.env_scale);
+                                }
+                            }
+                            Err(e) => log::error!("Failed to load environment map: {e:#}"),
+                        }
+                    }
+
+                    log::info!(
+                        "Loaded Mitsuba scene: {} ({} lights)",
+                        path.display(), loaded.lights.len(),
+                    );
                     Some(loaded.scene)
                 }
                 Err(e) => { log::error!("Failed to load Mitsuba scene: {e:#}"); None }
