@@ -76,7 +76,7 @@ pub fn load_obj(path: &Path) -> Result<Vec<ObjMesh>> {
 }
 
 /// Compute tangent vectors from position/UV derivatives using MikkTSpace-style averaging.
-fn compute_tangents(vertices: &mut [GpuVertex], indices: &[u32]) {
+pub fn compute_tangents(vertices: &mut [GpuVertex], indices: &[u32]) {
     // Accumulate tangents per vertex from triangle contributions
     let mut tangents = vec![[0.0f32; 3]; vertices.len()];
     let mut bitangents = vec![[0.0f32; 3]; vertices.len()];

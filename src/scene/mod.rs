@@ -2,6 +2,7 @@ pub mod gltf_loader;
 pub mod loader;
 pub mod mitsuba_loader;
 pub mod obj_loader;
+pub mod ply_loader;
 
 use ash::vk;
 use glam::{Mat4, Quat, Vec3};

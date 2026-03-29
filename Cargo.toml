@@ -20,6 +20,7 @@ anyhow         = "1"
 bytemuck       = { version = "1", features = ["derive"] }
 quick-xml      = "0.37"
 tobj           = "4"
+ply-rs         = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
