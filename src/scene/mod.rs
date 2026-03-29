@@ -52,8 +52,10 @@ pub struct GpuTexture {
 
 impl GpuTexture {
     pub unsafe fn destroy(&self, device: &ash::Device) {
-        self.image.destroy(device);
-        device.destroy_sampler(self.sampler, None);
+        unsafe {
+            self.image.destroy(device);
+            device.destroy_sampler(self.sampler, None);
+        }
     }
 }
 
@@ -84,8 +86,10 @@ pub struct GpuPrimitive {
 
 impl GpuPrimitive {
     pub unsafe fn destroy(&self, device: &ash::Device) {
-        self.vertex_buffer.destroy(device);
-        self.index_buffer.destroy(device);
+        unsafe {
+            self.vertex_buffer.destroy(device);
+            self.index_buffer.destroy(device);
+        }
     }
 }
 
@@ -98,7 +102,7 @@ pub struct GpuMesh {
 impl GpuMesh {
     pub unsafe fn destroy(&self, device: &ash::Device) {
         for p in &self.primitives {
-            p.destroy(device);
+            unsafe { p.destroy(device); }
         }
     }
 }
@@ -145,11 +149,11 @@ impl Scene {
 
     pub unsafe fn destroy(&self, device: &ash::Device) {
         for mesh in &self.meshes {
-            mesh.destroy(device);
+            unsafe { mesh.destroy(device); }
         }
         for tex in &self.textures {
-            tex.destroy(device);
+            unsafe { tex.destroy(device); }
         }
-        device.destroy_descriptor_pool(self.descriptor_pool, None);
+        unsafe { device.destroy_descriptor_pool(self.descriptor_pool, None); }
     }
 }

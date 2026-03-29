@@ -161,6 +161,7 @@ pub fn load_scene_from_input(
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[allow(clippy::collapsible_if)]
         if self.state.is_none() {
             if let Err(e) = self.init(event_loop) {
                 log::error!("Failed to initialize: {e:#}");
@@ -199,6 +200,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
+                    #[allow(clippy::collapsible_if)]
                     if let Err(e) = state.renderer.resize(size.width, size.height) {
                         log::error!("Resize failed: {e:#}");
                     }

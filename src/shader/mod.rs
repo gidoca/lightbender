@@ -31,17 +31,23 @@ impl ShaderLibrary {
         let frag_spv = load_spirv(frag_path)
             .with_context(|| format!("load frag shader: {}", frag_path.display()))?;
 
-        let vert = device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
-            .context("create vert shader module")?;
-        let frag = device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)
-            .context("create frag shader module")?;
+        let vert = unsafe {
+            device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
+                .context("create vert shader module")?
+        };
+        let frag = unsafe {
+            device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)
+                .context("create frag shader module")?
+        };
 
         // Destroy old modules if replacing
         if let Some(old) = self.pairs.remove(name) {
-            device.destroy_shader_module(old.vert, None);
-            device.destroy_shader_module(old.frag, None);
+            unsafe {
+                device.destroy_shader_module(old.vert, None);
+                device.destroy_shader_module(old.frag, None);
+            }
         }
 
         self.pairs.insert(name.to_string(), ShaderPair { vert, frag });
@@ -50,8 +56,10 @@ impl ShaderLibrary {
 
     pub unsafe fn destroy(&self, device: &ash::Device) {
         for pair in self.pairs.values() {
-            device.destroy_shader_module(pair.vert, None);
-            device.destroy_shader_module(pair.frag, None);
+            unsafe {
+                device.destroy_shader_module(pair.vert, None);
+                device.destroy_shader_module(pair.frag, None);
+            }
         }
     }
 }
