@@ -26,7 +26,7 @@
   "models": [
     {
       "name":    "avocado",
-      "path":    "../../glTF-Sample-Models/2.0/Avocado/glTF-Binary/Avocado.glb",
+      "path":    "./assets/Avocado.glb",
       "shader":  "pbr",
       "transform": {
         "translation": [0.0, 0.0, 0.0],

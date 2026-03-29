@@ -23,12 +23,12 @@
   "models": [
     {
       "name":   "helmet",
-      "path":   "../../glTF-Sample-Models/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
+      "path":   "./assets/DamagedHelmet.glb",
       "shader": "pbr"
     }
   ],
   "environment": {
-    "map": "../../mitsuba-examples/living-room/living-room/living-room/textures/Sky 19.exr",
-    "map_intensity": 0.01
+    "map": "./assets/bryanston_park_sunrise_1k.exr",
+    "map_intensity": 0.1
   }
 }

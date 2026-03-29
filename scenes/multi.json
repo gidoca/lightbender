@@ -26,7 +26,7 @@
   "models": [
     {
       "name":    "box_left",
-      "path":    "../../glTF-Sample-Models/2.0/Box/glTF-Binary/Box.glb",
+      "path":    "./assets/Box.glb",
       "shader":  "pbr",
       "transform": {
         "translation": [-1.5, 0.0, 0.0],
@@ -36,7 +36,7 @@
     },
     {
       "name":    "avocado_center",
-      "path":    "../../glTF-Sample-Models/2.0/Avocado/glTF-Binary/Avocado.glb",
+      "path":    "./assets/Avocado.glb",
       "shader":  "pbr",
       "transform": {
         "translation": [0.0, -0.05, 0.0],
@@ -46,7 +46,7 @@
     },
     {
       "name":    "box_right",
-      "path":    "../../glTF-Sample-Models/2.0/Box/glTF-Binary/Box.glb",
+      "path":    "./assets/Box.glb",
       "shader":  "pbr",
       "transform": {
         "translation": [1.5, 0.0, 0.0],
