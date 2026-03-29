@@ -222,10 +222,16 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.physical_key
-                    == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
-                {
-                    event_loop.exit();
+                use winit::event::ElementState;
+                use winit::keyboard::{KeyCode, PhysicalKey};
+                let pressed = event.state == ElementState::Pressed;
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
+                    PhysicalKey::Code(KeyCode::KeyW) => state.input.key_w = pressed,
+                    PhysicalKey::Code(KeyCode::KeyA) => state.input.key_a = pressed,
+                    PhysicalKey::Code(KeyCode::KeyS) => state.input.key_s = pressed,
+                    PhysicalKey::Code(KeyCode::KeyD) => state.input.key_d = pressed,
+                    _ => {}
                 }
             }
             WindowEvent::Resized(size) => {

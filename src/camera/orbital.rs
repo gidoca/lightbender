@@ -15,6 +15,7 @@ pub struct OrbitalCamera {
     orbit_sensitivity: f32,
     pan_sensitivity:   f32,
     zoom_sensitivity:  f32,
+    key_move_speed:    f32,
 }
 
 impl OrbitalCamera {
@@ -34,6 +35,7 @@ impl OrbitalCamera {
             orbit_sensitivity: 0.005,
             pan_sensitivity:   0.001,
             zoom_sensitivity:  0.1,
+            key_move_speed:    0.02,
         };
         cam.sync();
         cam
@@ -50,6 +52,18 @@ impl OrbitalCamera {
 
         if input.scroll_delta != 0.0 {
             self.zoom(input.scroll_delta);
+        }
+
+        let key_fwd   = (input.key_w as i8 - input.key_s as i8) as f32;
+        let key_right = (input.key_d as i8 - input.key_a as i8) as f32;
+        if key_fwd != 0.0 || key_right != 0.0 {
+            let forward = (self.target - self.camera.position).normalize();
+            let right   = forward.cross(Vec3::Y).normalize();
+            let step    = self.distance * self.key_move_speed;
+            let offset  = forward * key_fwd * step + right * key_right * step;
+            self.target          += offset;
+            self.camera.position += offset;
+            self.camera.target    = self.target;
         }
     }
 
@@ -149,6 +163,29 @@ mod tests {
             cam.zoom(100.0);
         }
         assert!(cam.distance >= 0.001);
+    }
+
+    #[test]
+    fn wasd_keys_move_camera() {
+        // yaw=0, pitch=0 → camera at (0,0,5), forward = (0,0,-1), right = (1,0,0)
+        let mut cam = OrbitalCamera::new(Vec3::ZERO, 5.0, 0.0, 0.0);
+        let initial_pos = cam.camera.position;
+        let initial_target = cam.target;
+
+        // W moves camera and target forward (−Z)
+        let input = InputState { key_w: true, ..Default::default() };
+        cam.update(&input);
+        assert!(cam.camera.position.z < initial_pos.z);
+        assert!(cam.target.z < initial_target.z);
+        // Yaw and pitch unchanged — no orbiting
+        assert_eq!(cam.yaw, 0.0);
+        assert_eq!(cam.pitch, 0.0);
+
+        // D moves camera and target right (+X)
+        let pos_after_w = cam.camera.position;
+        let input = InputState { key_d: true, ..Default::default() };
+        cam.update(&input);
+        assert!(cam.camera.position.x > pos_after_w.x);
     }
 
     #[test]

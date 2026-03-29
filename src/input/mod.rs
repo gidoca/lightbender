@@ -8,6 +8,10 @@ pub struct InputState {
     pub mouse_delta: (f64, f64),
     /// Scroll delta accumulated since last flush.
     pub scroll_delta: f32,
+    pub key_w: bool,
+    pub key_a: bool,
+    pub key_s: bool,
+    pub key_d: bool,
 }
 
 impl InputState {
@@ -39,12 +43,20 @@ mod tests {
             middle_button: true,
             mouse_delta: (3.0, -2.0),
             scroll_delta: 1.5,
+            key_w: true,
+            key_a: false,
+            key_s: true,
+            key_d: false,
         };
         input.flush();
         assert_eq!(input.mouse_delta, (0.0, 0.0));
         assert_eq!(input.scroll_delta, 0.0);
         assert!(input.left_button);
         assert!(input.middle_button);
+        assert!(input.key_w);
+        assert!(input.key_s);
+        assert!(!input.key_a);
+        assert!(!input.key_d);
     }
 
     #[test]
