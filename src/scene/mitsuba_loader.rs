@@ -13,6 +13,7 @@ use crate::vulkan::buffer::upload_to_device_local;
 use crate::vulkan::image::GpuImage;
 
 use super::{
+    gltf_loader::LoadContext,
     GpuMaterial, GpuMesh, GpuPrimitive, GpuTexture, Scene, SceneNode, Transform,
 };
 
@@ -219,12 +220,27 @@ pub fn load_mitsuba(renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaSce
 
         // Load base color texture if referenced
         let bc_tex_idx = if let Some(ref tex_path) = mat_desc.base_color_texture {
-            let resolved = resolve_path(base_dir, tex_path);
-            match load_texture(&resolved, &mut textures, &mut texture_index_cache) {
-                Ok(idx) => Some(idx),
-                Err(e) => {
-                    log::error!("Failed to load texture {}: {e:#}", resolved.display());
-                    None
+            if let Some(checker_spec) = tex_path.strip_prefix("__checkerboard:") {
+                // Generate procedural checkerboard texture
+                match generate_checkerboard_texture(checker_spec, &ctx) {
+                    Ok(tex) => {
+                        let idx = textures.len();
+                        textures.push(tex);
+                        Some(idx)
+                    }
+                    Err(e) => {
+                        log::error!("Failed to generate checkerboard: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                let resolved = resolve_path(base_dir, tex_path);
+                match load_texture(&resolved, &mut textures, &mut texture_index_cache) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        log::error!("Failed to load texture {}: {e:#}", resolved.display());
+                        None
+                    }
                 }
             }
         } else {
@@ -700,6 +716,54 @@ fn parse_shape(reader: &mut Reader<&[u8]>, shape_type: &str, base_dir: &Path) ->
     })
 }
 
+/// Generate a checkerboard texture from a spec string "r0:g0:b0:r1:g1:b1".
+fn generate_checkerboard_texture(spec: &str, ctx: &LoadContext) -> Result<GpuTexture> {
+    let vals: Vec<f32> = spec.split(':').filter_map(|s| s.parse().ok()).collect();
+    let (c0, c1) = if vals.len() >= 6 {
+        ([vals[0], vals[1], vals[2]], [vals[3], vals[4], vals[5]])
+    } else {
+        ([0.4, 0.4, 0.4], [0.2, 0.2, 0.2])
+    };
+
+    let size = 128u32;
+    let tiles = 8u32; // 8×8 check pattern
+    let tile_size = size / tiles;
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+
+    for y in 0..size {
+        for x in 0..size {
+            let tx = x / tile_size;
+            let ty = y / tile_size;
+            let is_c0 = (tx + ty).is_multiple_of(2);
+            let c = if is_c0 { c0 } else { c1 };
+            let idx = ((y * size + x) * 4) as usize;
+            pixels[idx]     = (c[0].clamp(0.0, 1.0) * 255.0) as u8;
+            pixels[idx + 1] = (c[1].clamp(0.0, 1.0) * 255.0) as u8;
+            pixels[idx + 2] = (c[2].clamp(0.0, 1.0) * 255.0) as u8;
+            pixels[idx + 3] = 255;
+        }
+    }
+
+    let image = unsafe {
+        GpuImage::upload_rgba8(
+            ctx.device, ctx.instance, ctx.physical_device,
+            ctx.command_pool, ctx.queue, size, size, &pixels,
+        )?
+    };
+    let sampler = unsafe {
+        ctx.device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT),
+            None,
+        )?
+    };
+    Ok(GpuTexture { image, sampler })
+}
+
 fn resolve_path(base: &Path, relative: &str) -> std::path::PathBuf {
     let p = Path::new(relative);
     if p.is_absolute() { p.to_path_buf() } else { base.join(p) }
@@ -948,17 +1012,38 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
                     "texture" => {
                         let tex_type = attr_str(e, "type").unwrap_or_default();
                         let tex_name = attr_str(e, "name").unwrap_or_default();
-                        if tex_type == "bitmap" {
-                            let tex_props = parse_properties(reader, b"texture")?;
-                            if let Some(filename) = tex_props.get_string("filename")
-                                && (tex_name == "reflectance" || tex_name == "diffuse_reflectance" || tex_name == "base_color")
-                            {
-                                mat.base_color_texture = Some(filename);
+                        let is_color_slot = tex_name == "reflectance"
+                            || tex_name == "diffuse_reflectance"
+                            || tex_name == "base_color";
+                        match tex_type.as_str() {
+                            "bitmap" => {
+                                let tex_props = parse_properties(reader, b"texture")?;
+                                if let Some(filename) = tex_props.get_string("filename")
+                                    && is_color_slot
+                                {
+                                    mat.base_color_texture = Some(filename);
+                                }
                             }
-                        } else {
-                            let end = e.to_end().into_owned();
-                            reader.read_to_end_into(end.name(), &mut skip_buf)?;
-                            skip_buf.clear();
+                            "checkerboard" => {
+                                let tex_props = parse_properties(reader, b"texture")?;
+                                if is_color_slot {
+                                    let color0 = tex_props.get_color("color0")
+                                        .unwrap_or(Vec3::new(0.4, 0.4, 0.4));
+                                    let color1 = tex_props.get_color("color1")
+                                        .unwrap_or(Vec3::new(0.2, 0.2, 0.2));
+                                    mat.base_color_texture = Some(
+                                        format!("__checkerboard:{}:{}:{}:{}:{}:{}",
+                                            color0.x, color0.y, color0.z,
+                                            color1.x, color1.y, color1.z)
+                                    );
+                                }
+                            }
+                            _ => {
+                                log::warn!("Unsupported texture type: {tex_type}");
+                                let end = e.to_end().into_owned();
+                                reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                                skip_buf.clear();
+                            }
                         }
                     }
                     _ => {
