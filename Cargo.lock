@@ -987,6 +987,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "lightbender-interaction",
  "lightbender-scene",
  "log",
  "ply-rs",
@@ -997,6 +998,13 @@ dependencies = [
  "tempfile",
  "tobj",
  "winit",
+]
+
+[[package]]
+name = "lightbender-interaction"
+version = "0.1.0"
+dependencies = [
+ "glam",
 ]
 
 [[package]]

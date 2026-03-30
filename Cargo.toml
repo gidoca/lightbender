@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lightbender-scene",
+    "crates/lightbender-interaction",
 ]
 
 [package]
@@ -11,6 +12,7 @@ build = "build.rs"
 
 [dependencies]
 lightbender-scene = { path = "crates/lightbender-scene" }
+lightbender-interaction = { path = "crates/lightbender-interaction" }
 ash            = "0.38"
 ash-window     = "0.13"
 raw-window-handle = "0.6"

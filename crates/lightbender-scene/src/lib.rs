@@ -49,6 +49,18 @@ pub struct FrameUniforms {
     pub _pad:            [u32; 2],
 }
 
+/// Material factors pushed alongside the model matrix (push constants).
+/// Starts at offset 64 (after the mat4 model matrix).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct MaterialPushConstants {
+    pub base_color_factor: [f32; 4],  // offset 64
+    pub emissive_factor:   [f32; 3],  // offset 80
+    pub metallic_factor:   f32,       // offset 92
+    pub roughness_factor:  f32,       // offset 96
+    pub _pad:              [f32; 3],  // offset 100, pad to 112 total
+}
+
 // ── Texture data ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
