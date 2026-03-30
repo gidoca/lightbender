@@ -339,7 +339,7 @@ impl Renderer {
 
         // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None)
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None, None)
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
@@ -810,7 +810,7 @@ impl Renderer {
 
         // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None)
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None, None)
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
@@ -1371,7 +1371,7 @@ impl Renderer {
     /// Build and register a named pipeline from an already-loaded shader pair.
     pub fn add_pipeline(&mut self, name: &str, pair: &ShaderPair) -> Result<()> {
         unsafe {
-            let (extra_layout, pipeline) = create_pipeline(
+            let (_layout, pipeline) = create_pipeline(
                 &self.device,
                 self.render_pass,
                 self.descriptor_set_layout,
@@ -1379,9 +1379,8 @@ impl Renderer {
                 self.env_set_layout,
                 self.pipeline_cache,
                 Some(pair),
+                Some(self.pipeline_layout),
             )?;
-            // create_pipeline always creates a new layout, but we reuse self.pipeline_layout
-            self.device.destroy_pipeline_layout(extra_layout, None);
             if let Some(old) = self.pipelines.insert(name.to_string(), pipeline) {
                 self.device.destroy_pipeline(old, None);
             }
@@ -2218,6 +2217,7 @@ unsafe fn create_material_set_layout(device: &ash::Device) -> Result<vk::Descrip
     )?)
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
@@ -2227,6 +2227,8 @@ unsafe fn create_pipeline(
     pipeline_cache: vk::PipelineCache,
     // Pre-loaded shader modules to use. If None, loads the built-in mesh shaders.
     shader_pair: Option<&ShaderPair>,
+    // If provided, reuse this layout instead of creating a new one.
+    existing_layout: Option<vk::PipelineLayout>,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     // Either use provided modules or load the built-in mesh shaders
     let (vert_module, frag_module, owned) = if let Some(pair) = shader_pair {
@@ -2316,19 +2318,23 @@ unsafe fn create_pipeline(
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-    let set_layouts = [descriptor_set_layout, material_set_layout, env_set_layout];
-    let push_constant_range = vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-        .offset(0)
-        .size(64 + std::mem::size_of::<MaterialPushConstants>() as u32); // mat4 + material factors
-    let layout = device
-        .create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default()
-                .set_layouts(&set_layouts)
-                .push_constant_ranges(std::slice::from_ref(&push_constant_range)),
-            None,
-        )
-        .context("pipeline layout")?;
+    let layout = if let Some(layout) = existing_layout {
+        layout
+    } else {
+        let set_layouts = [descriptor_set_layout, material_set_layout, env_set_layout];
+        let push_constant_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(64 + std::mem::size_of::<MaterialPushConstants>() as u32); // mat4 + material factors
+        device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&set_layouts)
+                    .push_constant_ranges(std::slice::from_ref(&push_constant_range)),
+                None,
+            )
+            .context("pipeline layout")?
+    };
 
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
