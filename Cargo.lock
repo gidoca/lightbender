@@ -988,6 +988,7 @@ dependencies = [
  "gltf",
  "image",
  "lightbender-interaction",
+ "lightbender-object-loaders",
  "lightbender-scene",
  "log",
  "ply-rs",
@@ -1005,6 +1006,20 @@ name = "lightbender-interaction"
 version = "0.1.0"
 dependencies = [
  "glam",
+]
+
+[[package]]
+name = "lightbender-object-loaders"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "gltf",
+ "image",
+ "lightbender-scene",
+ "log",
+ "ply-rs",
+ "tobj",
 ]
 
 [[package]]
