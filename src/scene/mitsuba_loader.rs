@@ -13,6 +13,7 @@ use crate::vulkan::buffer::upload_to_device_local;
 use crate::vulkan::image::GpuImage;
 
 use super::{
+    gltf_loader::LoadContext,
     GpuMaterial, GpuMesh, GpuPrimitive, GpuTexture, Scene, SceneNode, Transform,
 };
 
@@ -219,12 +220,27 @@ pub fn load_mitsuba(renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaSce
 
         // Load base color texture if referenced
         let bc_tex_idx = if let Some(ref tex_path) = mat_desc.base_color_texture {
-            let resolved = resolve_path(base_dir, tex_path);
-            match load_texture(&resolved, &mut textures, &mut texture_index_cache) {
-                Ok(idx) => Some(idx),
-                Err(e) => {
-                    log::error!("Failed to load texture {}: {e:#}", resolved.display());
-                    None
+            if let Some(checker_spec) = tex_path.strip_prefix("__checkerboard:") {
+                // Generate procedural checkerboard texture
+                match generate_checkerboard_texture(checker_spec, &ctx) {
+                    Ok(tex) => {
+                        let idx = textures.len();
+                        textures.push(tex);
+                        Some(idx)
+                    }
+                    Err(e) => {
+                        log::error!("Failed to generate checkerboard: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                let resolved = resolve_path(base_dir, tex_path);
+                match load_texture(&resolved, &mut textures, &mut texture_index_cache) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        log::error!("Failed to load texture {}: {e:#}", resolved.display());
+                        None
+                    }
                 }
             }
         } else {
@@ -270,7 +286,7 @@ pub fn load_mitsuba(renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaSce
 
         let mat_idx = materials.len();
         materials.push(GpuMaterial {
-            base_color_factor:          [mat_desc.base_color.x, mat_desc.base_color.y, mat_desc.base_color.z, 1.0],
+            base_color_factor:          [mat_desc.base_color.x, mat_desc.base_color.y, mat_desc.base_color.z, mat_desc.alpha],
             metallic_factor:            mat_desc.metallic,
             roughness_factor:           mat_desc.roughness,
             emissive_factor:            [emissive.x, emissive.y, emissive.z],
@@ -385,19 +401,25 @@ pub fn load_mitsuba(renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaSce
 // ── Sensor (camera) parsing ──────────────────────────────────────────────────
 
 struct MitsubaCameraDesc {
-    fov_y:    f32, // degrees
+    fov:      f32, // degrees, as specified in the scene
+    fov_axis: String, // "x" (default), "y", "smaller", "larger"
     near:     f32,
     far:      f32,
     to_world: Mat4,
+    film_width:  u32,
+    film_height: u32,
 }
 
 impl Default for MitsubaCameraDesc {
     fn default() -> Self {
         Self {
-            fov_y:    45.0,
+            fov:      45.0,
+            fov_axis: "x".to_string(),
             near:     0.01,
             far:      1000.0,
             to_world: Mat4::IDENTITY,
+            film_width:  768,
+            film_height: 576,
         }
     }
 }
@@ -415,11 +437,16 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
                     && let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value"))
                 {
                     match name.as_str() {
-                        "fov" => desc.fov_y = val,
+                        "fov" => desc.fov = val,
                         "near_clip" => desc.near = val,
                         "far_clip" => desc.far = val,
                         _ => {}
                     }
+                } else if tag.as_ref() == b"string"
+                    && let (Some(name), Some(val)) = (attr_str(e, "name"), attr_str(e, "value"))
+                    && name == "fov_axis"
+                {
+                    desc.fov_axis = val;
                 }
             }
             Event::Start(ref e) => {
@@ -428,8 +455,10 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
                     "transform" => {
                         desc.to_world = parse_transform(reader)?;
                     }
+                    "film" => {
+                        parse_film_into(reader, &mut desc)?;
+                    }
                     _ => {
-                        // Skip film, sampler, etc.
                         let end = e.to_end().into_owned();
                         let mut skip_buf = Vec::new();
                         reader.read_to_end_into(end.name(), &mut skip_buf)?;
@@ -446,25 +475,71 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
     Ok(desc)
 }
 
+/// Parse `<film>` to extract width/height.
+fn parse_film_into(reader: &mut Reader<&[u8]>, desc: &mut MitsubaCameraDesc) -> Result<()> {
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf).context("parse_film")? {
+            Event::Empty(ref e) => {
+                if e.name().as_ref() == b"integer"
+                    && let (Some(name), Some(val)) = (attr_str(e, "name"), attr_str(e, "value"))
+                {
+                    match name.as_str() {
+                        "width"  => { desc.film_width  = val.parse().unwrap_or(desc.film_width); }
+                        "height" => { desc.film_height = val.parse().unwrap_or(desc.film_height); }
+                        _ => {}
+                    }
+                }
+            }
+            Event::Start(ref e) => {
+                let end = e.to_end().into_owned();
+                let mut skip_buf = Vec::new();
+                reader.read_to_end_into(end.name(), &mut skip_buf)?;
+            }
+            Event::End(ref e) if e.name().as_ref() == b"film" => break,
+            Event::Eof => anyhow::bail!("unexpected EOF inside <film>"),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(())
+}
+
 /// Convert Mitsuba camera description to an OrbitalCamera.
 fn camera_from_mitsuba(desc: &MitsubaCameraDesc) -> OrbitalCamera {
-    // Extract camera position from to_world matrix (column 3)
+    // Extract camera position and forward direction from the to_world matrix.
+    // In Mitsuba's convention, column 2 (+Z) is the forward (viewing) direction.
     let origin = desc.to_world.col(3).truncate();
-    // Forward direction is -Z in camera space
-    let forward = -desc.to_world.col(2).truncate().normalize();
-    // Place the look-at target 1 unit ahead in the forward direction,
-    // then use the distance from origin to target for the orbital distance.
-    let distance = 5.0; // default orbital distance
+    let forward = desc.to_world.col(2).truncate().normalize();
+
+    // Place the orbital target along the forward direction.  Use the distance
+    // from origin to the world origin as a heuristic, with a minimum of 1.0.
+    let distance = origin.length().max(1.0);
     let target = origin + forward * distance;
 
-    // Compute yaw and pitch from the offset vector (origin - target)
+    // Decompose into spherical coordinates matching OrbitalCamera::sync():
+    //   x = dist * cos(pitch) * sin(yaw)
+    //   y = dist * sin(pitch)
+    //   z = dist * cos(pitch) * cos(yaw)
     let offset = origin - target;
     let dist = offset.length().max(0.001);
     let pitch = (offset.y / dist).asin();
-    let yaw = offset.z.atan2(offset.x) - std::f32::consts::FRAC_PI_2;
+    let yaw = offset.x.atan2(offset.z);
 
     let mut cam = OrbitalCamera::new(target, dist, yaw.to_degrees(), pitch.to_degrees());
-    cam.camera.fov_y = desc.fov_y.to_radians();
+
+    // Convert FOV to vertical radians.  Mitsuba's fov_axis defaults to "x" (horizontal).
+    let aspect = desc.film_width as f32 / desc.film_height as f32;
+    let fov_rad = desc.fov.to_radians();
+    let hfov_to_vfov = |h: f32| 2.0 * ((h * 0.5).tan() / aspect).atan();
+    let is_horizontal = match desc.fov_axis.as_str() {
+        "y" => false,
+        "x" | "" => true,
+        "smaller" => aspect < 1.0,  // smaller dim is x when aspect < 1 → fov is horizontal
+        "larger"  => aspect >= 1.0, // larger dim is x when aspect >= 1 → fov is horizontal
+        _ => true,
+    };
+    cam.camera.fov_y = if is_horizontal { hfov_to_vfov(fov_rad) } else { fov_rad };
     cam.camera.near = desc.near;
     cam.camera.far = desc.far;
     cam
@@ -700,6 +775,54 @@ fn parse_shape(reader: &mut Reader<&[u8]>, shape_type: &str, base_dir: &Path) ->
     })
 }
 
+/// Generate a checkerboard texture from a spec string "r0:g0:b0:r1:g1:b1".
+fn generate_checkerboard_texture(spec: &str, ctx: &LoadContext) -> Result<GpuTexture> {
+    let vals: Vec<f32> = spec.split(':').filter_map(|s| s.parse().ok()).collect();
+    let (c0, c1) = if vals.len() >= 6 {
+        ([vals[0], vals[1], vals[2]], [vals[3], vals[4], vals[5]])
+    } else {
+        ([0.4, 0.4, 0.4], [0.2, 0.2, 0.2])
+    };
+
+    let size = 128u32;
+    let tiles = 8u32; // 8×8 check pattern
+    let tile_size = size / tiles;
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+
+    for y in 0..size {
+        for x in 0..size {
+            let tx = x / tile_size;
+            let ty = y / tile_size;
+            let is_c0 = (tx + ty).is_multiple_of(2);
+            let c = if is_c0 { c0 } else { c1 };
+            let idx = ((y * size + x) * 4) as usize;
+            pixels[idx]     = (c[0].clamp(0.0, 1.0) * 255.0) as u8;
+            pixels[idx + 1] = (c[1].clamp(0.0, 1.0) * 255.0) as u8;
+            pixels[idx + 2] = (c[2].clamp(0.0, 1.0) * 255.0) as u8;
+            pixels[idx + 3] = 255;
+        }
+    }
+
+    let image = unsafe {
+        GpuImage::upload_rgba8(
+            ctx.device, ctx.instance, ctx.physical_device,
+            ctx.command_pool, ctx.queue, size, size, &pixels,
+        )?
+    };
+    let sampler = unsafe {
+        ctx.device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT),
+            None,
+        )?
+    };
+    Ok(GpuTexture { image, sampler })
+}
+
 fn resolve_path(base: &Path, relative: &str) -> std::path::PathBuf {
     let p = Path::new(relative);
     if p.is_absolute() { p.to_path_buf() } else { base.join(p) }
@@ -887,22 +1010,39 @@ fn generate_cylinder(segments: u32, flip: bool) -> (Vec<GpuVertex>, Vec<u32>) {
 #[derive(Clone, Debug)]
 struct MitsubaMaterial {
     base_color:    Vec3,
+    alpha:         f32, // opacity (1.0 = opaque)
     metallic:      f32,
     roughness:     f32,
     emissive:      Vec3,
     double_sided:  bool,
     base_color_texture: Option<String>, // path to bitmap texture
+    // Extended properties for improved BSDF mapping
+    int_ior:              Option<f32>,
+    ext_ior:              Option<f32>,
+    specular_reflectance: Option<Vec3>,
+    conductor_material:   Option<String>, // e.g. "Au", "Cu", "Ag"
+    eta:                  Option<Vec3>,   // complex IOR (real part)
+    k:                    Option<Vec3>,   // complex IOR (imaginary part)
+    blend_weight:         Option<f32>,   // for blendbsdf
 }
 
 impl Default for MitsubaMaterial {
     fn default() -> Self {
         Self {
             base_color:    Vec3::new(0.5, 0.5, 0.5),
+            alpha:         1.0,
             metallic:      0.0,
             roughness:     1.0,
             emissive:      Vec3::ZERO,
             double_sided:  false,
             base_color_texture: None,
+            int_ior:              None,
+            ext_ior:              None,
+            specular_reflectance: None,
+            conductor_material:   None,
+            eta:                  None,
+            k:                    None,
+            blend_weight:         None,
         }
     }
 }
@@ -912,7 +1052,7 @@ impl Default for MitsubaMaterial {
 fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMaterial> {
     let mut mat = MitsubaMaterial::default();
     let mut buf = Vec::new();
-    let mut inner_bsdf: Option<MitsubaMaterial> = None;
+    let mut inner_bsdfs: Vec<MitsubaMaterial> = Vec::new();
     let mut skip_buf = Vec::new();
 
     loop {
@@ -926,22 +1066,43 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
                 match tag.as_str() {
                     "bsdf" => {
                         let inner_type = attr_str(e, "type").unwrap_or_default();
-                        inner_bsdf = Some(parse_bsdf(reader, &inner_type)?);
+                        inner_bsdfs.push(parse_bsdf(reader, &inner_type)?);
                     }
                     "texture" => {
                         let tex_type = attr_str(e, "type").unwrap_or_default();
                         let tex_name = attr_str(e, "name").unwrap_or_default();
-                        if tex_type == "bitmap" {
-                            let tex_props = parse_properties(reader, b"texture")?;
-                            if let Some(filename) = tex_props.get_string("filename")
-                                && (tex_name == "reflectance" || tex_name == "diffuse_reflectance" || tex_name == "base_color")
-                            {
-                                mat.base_color_texture = Some(filename);
+                        let is_color_slot = tex_name == "reflectance"
+                            || tex_name == "diffuse_reflectance"
+                            || tex_name == "base_color";
+                        match tex_type.as_str() {
+                            "bitmap" => {
+                                let tex_props = parse_properties(reader, b"texture")?;
+                                if let Some(filename) = tex_props.get_string("filename")
+                                    && is_color_slot
+                                {
+                                    mat.base_color_texture = Some(filename);
+                                }
                             }
-                        } else {
-                            let end = e.to_end().into_owned();
-                            reader.read_to_end_into(end.name(), &mut skip_buf)?;
-                            skip_buf.clear();
+                            "checkerboard" => {
+                                let tex_props = parse_properties(reader, b"texture")?;
+                                if is_color_slot {
+                                    let color0 = tex_props.get_color("color0")
+                                        .unwrap_or(Vec3::new(0.4, 0.4, 0.4));
+                                    let color1 = tex_props.get_color("color1")
+                                        .unwrap_or(Vec3::new(0.2, 0.2, 0.2));
+                                    mat.base_color_texture = Some(
+                                        format!("__checkerboard:{}:{}:{}:{}:{}:{}",
+                                            color0.x, color0.y, color0.z,
+                                            color1.x, color1.y, color1.z)
+                                    );
+                                }
+                            }
+                            _ => {
+                                log::warn!("Unsupported texture type: {tex_type}");
+                                let end = e.to_end().into_owned();
+                                reader.read_to_end_into(end.name(), &mut skip_buf)?;
+                                skip_buf.clear();
+                            }
                         }
                     }
                     _ => {
@@ -961,16 +1122,48 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
     // Apply BSDF-type-specific mapping
     apply_bsdf_type_mapping(&mut mat, bsdf_type);
 
-    // Handle twosided: inherit from inner BSDF
-    if bsdf_type == "twosided" {
-        if let Some(inner) = inner_bsdf {
-            mat.base_color = inner.base_color;
-            mat.metallic = inner.metallic;
-            mat.roughness = inner.roughness;
-            mat.emissive = inner.emissive;
-            mat.base_color_texture = inner.base_color_texture;
+    // Handle composite BSDF types that depend on inner BSDFs
+    match bsdf_type {
+        "twosided" => {
+            if let Some(inner) = inner_bsdfs.into_iter().next() {
+                mat.base_color = inner.base_color;
+                mat.alpha = inner.alpha;
+                mat.metallic = inner.metallic;
+                mat.roughness = inner.roughness;
+                mat.emissive = inner.emissive;
+                mat.base_color_texture = inner.base_color_texture;
+            }
+            mat.double_sided = true;
         }
-        mat.double_sided = true;
+        "blendbsdf" => {
+            let w = mat.blend_weight.unwrap_or(0.5);
+            let mut iter = inner_bsdfs.into_iter();
+            if let (Some(a), Some(b)) = (iter.next(), iter.next()) {
+                mat.base_color = a.base_color * (1.0 - w) + b.base_color * w;
+                mat.alpha = a.alpha * (1.0 - w) + b.alpha * w;
+                mat.metallic = a.metallic * (1.0 - w) + b.metallic * w;
+                mat.roughness = a.roughness * (1.0 - w) + b.roughness * w;
+                mat.emissive = a.emissive * (1.0 - w) + b.emissive * w;
+                mat.double_sided = a.double_sided || b.double_sided;
+                mat.base_color_texture = a.base_color_texture.or(b.base_color_texture);
+            }
+        }
+        "mask" => {
+            // Opacity mask: inner BSDF provides surface properties, opacity from 'opacity' property
+            if let Some(inner) = inner_bsdfs.into_iter().next() {
+                mat.base_color = inner.base_color;
+                mat.metallic = inner.metallic;
+                mat.roughness = inner.roughness;
+                mat.emissive = inner.emissive;
+                mat.base_color_texture = inner.base_color_texture;
+                mat.double_sided = inner.double_sided;
+            }
+            // mat.alpha is already set from 'opacity' float property (handled below)
+        }
+        "null" => {
+            mat.alpha = 0.0;
+        }
+        _ => {}
     }
 
     Ok(mat)
@@ -990,20 +1183,31 @@ fn handle_bsdf_property(e: &quick_xml::events::BytesStart, tag: &str, mat: &mut 
             {
                 match name.as_str() {
                     "reflectance" | "diffuse_reflectance" | "base_color" => mat.base_color = c,
-                    "specular_reflectance" => {} // handled in type mapping
+                    "specular_reflectance" => mat.specular_reflectance = Some(c),
+                    "eta" => mat.eta = Some(c),
+                    "k" => mat.k = Some(c),
                     _ => {}
                 }
             }
         }
         "float" => {
-            if let Some(v) = attr_f32(e, "value")
-                && name == "alpha"
-            {
-                mat.roughness = v;
+            if let Some(v) = attr_f32(e, "value") {
+                match name.as_str() {
+                    "alpha" => mat.roughness = v,
+                    "int_ior" => mat.int_ior = Some(v),
+                    "ext_ior" => mat.ext_ior = Some(v),
+                    "opacity" => mat.alpha = v,
+                    "weight" => mat.blend_weight = Some(v),
+                    _ => {}
+                }
             }
         }
         "string" => {
-            // 'material' name for conductors handled in type mapping
+            if let Some(v) = attr_str(e, "value")
+                && name == "material"
+            {
+                mat.conductor_material = Some(v);
+            }
         }
         _ => {}
     }
@@ -1016,28 +1220,43 @@ fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
             mat.metallic = 0.0;
             mat.roughness = 1.0;
         }
-        "roughplastic" => {
+        "roughplastic" | "plastic" => {
             mat.metallic = 0.0;
-            // roughness already set from 'alpha'
+            if bsdf_type == "plastic" {
+                mat.roughness = 0.01;
+            }
+            // Compute F0 from IOR for dielectric fresnel
+            let int_ior = mat.int_ior.unwrap_or(1.49); // default polypropylene
+            let ext_ior = mat.ext_ior.unwrap_or(1.000277);
+            let f0_scalar = ((int_ior - ext_ior) / (int_ior + ext_ior)).powi(2);
+            // For plastics, the specular reflectance modulates the Fresnel
+            if let Some(spec) = mat.specular_reflectance {
+                // Scale base color to account for energy conservation
+                mat.base_color *= 1.0 - spec.x.max(spec.y).max(spec.z) * f0_scalar;
+            }
+            let _ = f0_scalar; // F0 used implicitly via metallic=0 + dielectric fresnel in shader
         }
-        "plastic" => {
-            mat.metallic = 0.0;
-            mat.roughness = 0.1;
-        }
-        "roughconductor" => {
+        "roughconductor" | "conductor" => {
             mat.metallic = 1.0;
-            // roughness from 'alpha', base_color from material name (later step)
-        }
-        "conductor" => {
-            mat.metallic = 1.0;
-            mat.roughness = 0.01;
+            if bsdf_type == "conductor" {
+                mat.roughness = 0.01;
+            }
+            // Derive base_color (F0) from conductor properties
+            let f0 = conductor_f0(mat);
+            mat.base_color = f0;
         }
         "dielectric" | "roughdielectric" | "thindielectric" => {
             mat.metallic = 0.0;
             if bsdf_type == "dielectric" || bsdf_type == "thindielectric" {
                 mat.roughness = 0.0;
             }
-            // Transparency will be handled in Phase 2
+            // Approximate glass: semi-transparent with specular highlights
+            let int_ior = mat.int_ior.unwrap_or(1.5);
+            let ext_ior = mat.ext_ior.unwrap_or(1.000277);
+            let f0 = ((int_ior - ext_ior) / (int_ior + ext_ior)).powi(2);
+            mat.base_color = Vec3::ONE;
+            mat.alpha = f0.max(0.05); // at least slightly visible
+            mat.double_sided = true;
         }
         "twosided" => {
             // Handled after inner BSDF is parsed
@@ -1048,6 +1267,64 @@ fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
             }
         }
     }
+}
+
+/// Compute F0 (normal-incidence reflectance) for a conductor material.
+fn conductor_f0(mat: &MitsubaMaterial) -> Vec3 {
+    // If eta and k are specified directly, compute from complex IOR
+    if let (Some(eta), Some(k)) = (mat.eta, mat.k) {
+        return compute_conductor_f0(eta, k);
+    }
+
+    // If a named material is given, look up from table
+    if let Some(ref name) = mat.conductor_material
+        && let Some(f0) = conductor_f0_table(name)
+    {
+        return if let Some(spec) = mat.specular_reflectance {
+            f0 * spec
+        } else {
+            f0
+        };
+    }
+
+    // If specular_reflectance is given, use directly
+    if let Some(spec) = mat.specular_reflectance {
+        return spec;
+    }
+
+    // Fallback: generic shiny metal
+    Vec3::new(0.9, 0.9, 0.9)
+}
+
+/// F0 from complex IOR: F0 = ((n-1)² + k²) / ((n+1)² + k²) per channel
+fn compute_conductor_f0(eta: Vec3, k: Vec3) -> Vec3 {
+    let f = |n: f32, kk: f32| -> f32 {
+        ((n - 1.0).powi(2) + kk.powi(2)) / ((n + 1.0).powi(2) + kk.powi(2))
+    };
+    Vec3::new(f(eta.x, k.x), f(eta.y, k.y), f(eta.z, k.z))
+}
+
+/// Lookup table for common conductor materials → F0 at normal incidence.
+/// Values are approximate sRGB F0 derived from spectral data.
+fn conductor_f0_table(name: &str) -> Option<Vec3> {
+    Some(match name {
+        "Au" | "gold"           => Vec3::new(1.000, 0.710, 0.290),
+        "Ag" | "silver"         => Vec3::new(0.950, 0.930, 0.880),
+        "Cu" | "copper"         => Vec3::new(0.950, 0.640, 0.540),
+        "Al" | "aluminum"       => Vec3::new(0.910, 0.920, 0.920),
+        "Fe" | "iron"           => Vec3::new(0.560, 0.570, 0.580),
+        "Cr" | "chromium"       => Vec3::new(0.550, 0.550, 0.550),
+        "Ni" | "nickel"         => Vec3::new(0.660, 0.610, 0.530),
+        "Ti" | "titanium"       => Vec3::new(0.540, 0.500, 0.430),
+        "W"  | "tungsten"       => Vec3::new(0.500, 0.510, 0.540),
+        "Pt" | "platinum"       => Vec3::new(0.670, 0.640, 0.590),
+        "Pb" | "lead"           => Vec3::new(0.630, 0.630, 0.630),
+        "Zn" | "zinc"           => Vec3::new(0.640, 0.620, 0.580),
+        "V"  | "vanadium"       => Vec3::new(0.530, 0.500, 0.470),
+        "Hg" | "mercury"        => Vec3::new(0.780, 0.780, 0.780),
+        "none" | "default"      => Vec3::new(0.900, 0.900, 0.900),
+        _ => return None,
+    })
 }
 
 // ── Property bag (generic Mitsuba property parsing) ──────────────────────────
@@ -1360,16 +1637,22 @@ fn parse_lookat_element(e: &quick_xml::events::BytesStart) -> Result<Mat4> {
     let target = parse_vec3(&target_str)?;
     let up = parse_vec3(&up_str)?;
 
-    // Mitsuba's to_world lookat gives a camera-to-world matrix.
-    // glam's look_at_rh gives world-to-camera, so we invert.
-    let view = Mat4::look_at_rh(origin, target, up);
-    Ok(view.inverse())
+    // Build the camera-to-world matrix in Mitsuba's convention:
+    // column 2 (+Z) = forward direction (toward target).
+    let dir = (target - origin).normalize();
+    let left = up.cross(dir).normalize();
+    let new_up = dir.cross(left);
+    Ok(Mat4::from_cols(
+        left.extend(0.0),
+        new_up.extend(0.0),
+        dir.extend(0.0),
+        origin.extend(1.0),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec4;
 
     fn approx_eq_mat4(a: &Mat4, b: &Mat4, eps: f32) -> bool {
         for c in 0..4 {
@@ -1450,12 +1733,13 @@ mod tests {
         let m = parse_transform_str(
             r#"<lookat origin="0, 0, 5" target="0, 0, 0" up="0, 1, 0"/>"#,
         ).unwrap();
-        // Camera at (0,0,5) looking at origin. The to_world matrix should put
-        // origin at (0,0,5) and forward along -Z (toward origin).
-        let origin = m * Vec4::new(0.0, 0.0, 0.0, 1.0);
-        assert!((origin.x - 0.0).abs() < 1e-5);
-        assert!((origin.y - 0.0).abs() < 1e-5);
-        assert!((origin.z - 5.0).abs() < 1e-5);
+        // Camera at (0,0,5) looking at origin.
+        // Column 3 = camera position
+        let pos = m.col(3).truncate();
+        assert!((pos - Vec3::new(0.0, 0.0, 5.0)).length() < 1e-5);
+        // Column 2 = forward direction (+Z in Mitsuba convention) = toward target
+        let fwd = m.col(2).truncate().normalize();
+        assert!((fwd - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5);
     }
 
     fn parse_sensor_str(xml: &str) -> Result<MitsubaCameraDesc> {
@@ -1484,16 +1768,24 @@ mod tests {
             </transform>
         "#).unwrap();
 
-        assert!((desc.fov_y - 60.0).abs() < 1e-6);
+        assert!((desc.fov - 60.0).abs() < 1e-6);
+        assert_eq!(desc.fov_axis, "x"); // default
         assert!((desc.near - 0.1).abs() < 1e-6);
         assert!((desc.far - 500.0).abs() < 1e-6);
 
         let cam = camera_from_mitsuba(&desc);
-        // Camera should be roughly at (0, 5, 10)
+        // Camera should be at (0, 5, 10), looking at origin
         let pos = cam.camera.position;
-        assert!((pos.x).abs() < 0.5, "x={}", pos.x);
-        assert!((pos.y - 5.0).abs() < 0.5, "y={}", pos.y);
-        assert!((pos.z - 10.0).abs() < 0.5, "z={}", pos.z);
+        assert!((pos.x).abs() < 0.01, "x={}", pos.x);
+        assert!((pos.y - 5.0).abs() < 0.01, "y={}", pos.y);
+        assert!((pos.z - 10.0).abs() < 0.01, "z={}", pos.z);
+        // Target should be at origin
+        assert!(cam.target.length() < 0.01, "target={:?}", cam.target);
+        // FOV should be converted from horizontal (60°) to vertical
+        // With default 768x576 (aspect=4/3): vfov = 2*atan(tan(30°)/1.333) ≈ 46.8°
+        let expected_vfov = 2.0 * ((60f32.to_radians() * 0.5).tan() / (768.0 / 576.0)).atan();
+        assert!((cam.camera.fov_y - expected_vfov).abs() < 0.01,
+            "fov_y={} expected={}", cam.camera.fov_y.to_degrees(), expected_vfov.to_degrees());
     }
 
     fn parse_bsdf_str(xml: &str, bsdf_type: &str) -> Result<MitsubaMaterial> {
