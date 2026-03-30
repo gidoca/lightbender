@@ -3,6 +3,7 @@ members = [
     "crates/lightbender-scene",
     "crates/lightbender-interaction",
     "crates/lightbender-object-loaders",
+    "crates/lightbender-scene-loaders",
 ]
 
 [package]
@@ -15,6 +16,7 @@ build = "build.rs"
 lightbender-scene = { path = "crates/lightbender-scene" }
 lightbender-interaction = { path = "crates/lightbender-interaction" }
 lightbender-object-loaders = { path = "crates/lightbender-object-loaders" }
+lightbender-scene-loaders = { path = "crates/lightbender-scene-loaders" }
 ash            = "0.38"
 ash-window     = "0.13"
 raw-window-handle = "0.6"

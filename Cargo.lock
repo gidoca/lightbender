@@ -990,6 +990,7 @@ dependencies = [
  "lightbender-interaction",
  "lightbender-object-loaders",
  "lightbender-scene",
+ "lightbender-scene-loaders",
  "log",
  "ply-rs",
  "quick-xml 0.37.5",
@@ -1029,6 +1030,20 @@ dependencies = [
  "bytemuck",
  "glam",
  "serde",
+]
+
+[[package]]
+name = "lightbender-scene-loaders"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "lightbender-object-loaders",
+ "lightbender-scene",
+ "log",
+ "quick-xml 0.37.5",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
