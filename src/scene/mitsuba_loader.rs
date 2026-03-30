@@ -464,20 +464,24 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
 
 /// Convert Mitsuba camera description to an OrbitalCamera.
 fn camera_from_mitsuba(desc: &MitsubaCameraDesc) -> OrbitalCamera {
-    // Extract camera position from to_world matrix (column 3)
+    // Extract camera position and forward direction from the to_world matrix.
+    // In Mitsuba's convention, column 2 (+Z) is the forward (viewing) direction.
     let origin = desc.to_world.col(3).truncate();
-    // Forward direction is -Z in camera space
-    let forward = -desc.to_world.col(2).truncate().normalize();
-    // Place the look-at target 1 unit ahead in the forward direction,
-    // then use the distance from origin to target for the orbital distance.
-    let distance = 5.0; // default orbital distance
+    let forward = desc.to_world.col(2).truncate().normalize();
+
+    // Place the orbital target along the forward direction.  Use the distance
+    // from origin to the world origin as a heuristic, with a minimum of 1.0.
+    let distance = origin.length().max(1.0);
     let target = origin + forward * distance;
 
-    // Compute yaw and pitch from the offset vector (origin - target)
+    // Decompose into spherical coordinates matching OrbitalCamera::sync():
+    //   x = dist * cos(pitch) * sin(yaw)
+    //   y = dist * sin(pitch)
+    //   z = dist * cos(pitch) * cos(yaw)
     let offset = origin - target;
     let dist = offset.length().max(0.001);
     let pitch = (offset.y / dist).asin();
-    let yaw = offset.z.atan2(offset.x) - std::f32::consts::FRAC_PI_2;
+    let yaw = offset.x.atan2(offset.z);
 
     let mut cam = OrbitalCamera::new(target, dist, yaw.to_degrees(), pitch.to_degrees());
     cam.camera.fov_y = desc.fov_y.to_radians();
@@ -1578,16 +1582,22 @@ fn parse_lookat_element(e: &quick_xml::events::BytesStart) -> Result<Mat4> {
     let target = parse_vec3(&target_str)?;
     let up = parse_vec3(&up_str)?;
 
-    // Mitsuba's to_world lookat gives a camera-to-world matrix.
-    // glam's look_at_rh gives world-to-camera, so we invert.
-    let view = Mat4::look_at_rh(origin, target, up);
-    Ok(view.inverse())
+    // Build the camera-to-world matrix in Mitsuba's convention:
+    // column 2 (+Z) = forward direction (toward target).
+    let dir = (target - origin).normalize();
+    let left = up.cross(dir).normalize();
+    let new_up = dir.cross(left);
+    Ok(Mat4::from_cols(
+        left.extend(0.0),
+        new_up.extend(0.0),
+        dir.extend(0.0),
+        origin.extend(1.0),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec4;
 
     fn approx_eq_mat4(a: &Mat4, b: &Mat4, eps: f32) -> bool {
         for c in 0..4 {
@@ -1668,12 +1678,13 @@ mod tests {
         let m = parse_transform_str(
             r#"<lookat origin="0, 0, 5" target="0, 0, 0" up="0, 1, 0"/>"#,
         ).unwrap();
-        // Camera at (0,0,5) looking at origin. The to_world matrix should put
-        // origin at (0,0,5) and forward along -Z (toward origin).
-        let origin = m * Vec4::new(0.0, 0.0, 0.0, 1.0);
-        assert!((origin.x - 0.0).abs() < 1e-5);
-        assert!((origin.y - 0.0).abs() < 1e-5);
-        assert!((origin.z - 5.0).abs() < 1e-5);
+        // Camera at (0,0,5) looking at origin.
+        // Column 3 = camera position
+        let pos = m.col(3).truncate();
+        assert!((pos - Vec3::new(0.0, 0.0, 5.0)).length() < 1e-5);
+        // Column 2 = forward direction (+Z in Mitsuba convention) = toward target
+        let fwd = m.col(2).truncate().normalize();
+        assert!((fwd - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5);
     }
 
     fn parse_sensor_str(xml: &str) -> Result<MitsubaCameraDesc> {
@@ -1707,11 +1718,13 @@ mod tests {
         assert!((desc.far - 500.0).abs() < 1e-6);
 
         let cam = camera_from_mitsuba(&desc);
-        // Camera should be roughly at (0, 5, 10)
+        // Camera should be at (0, 5, 10), looking at origin
         let pos = cam.camera.position;
-        assert!((pos.x).abs() < 0.5, "x={}", pos.x);
-        assert!((pos.y - 5.0).abs() < 0.5, "y={}", pos.y);
-        assert!((pos.z - 10.0).abs() < 0.5, "z={}", pos.z);
+        assert!((pos.x).abs() < 0.01, "x={}", pos.x);
+        assert!((pos.y - 5.0).abs() < 0.01, "y={}", pos.y);
+        assert!((pos.z - 10.0).abs() < 0.01, "z={}", pos.z);
+        // Target should be at origin
+        assert!(cam.target.length() < 0.01, "target={:?}", cam.target);
     }
 
     fn parse_bsdf_str(xml: &str, bsdf_type: &str) -> Result<MitsubaMaterial> {
