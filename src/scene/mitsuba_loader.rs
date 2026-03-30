@@ -401,19 +401,25 @@ pub fn load_mitsuba(renderer: &Renderer, path: &Path) -> Result<LoadedMitsubaSce
 // ── Sensor (camera) parsing ──────────────────────────────────────────────────
 
 struct MitsubaCameraDesc {
-    fov_y:    f32, // degrees
+    fov:      f32, // degrees, as specified in the scene
+    fov_axis: String, // "x" (default), "y", "smaller", "larger"
     near:     f32,
     far:      f32,
     to_world: Mat4,
+    film_width:  u32,
+    film_height: u32,
 }
 
 impl Default for MitsubaCameraDesc {
     fn default() -> Self {
         Self {
-            fov_y:    45.0,
+            fov:      45.0,
+            fov_axis: "x".to_string(),
             near:     0.01,
             far:      1000.0,
             to_world: Mat4::IDENTITY,
+            film_width:  768,
+            film_height: 576,
         }
     }
 }
@@ -431,11 +437,16 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
                     && let (Some(name), Some(val)) = (attr_str(e, "name"), attr_f32(e, "value"))
                 {
                     match name.as_str() {
-                        "fov" => desc.fov_y = val,
+                        "fov" => desc.fov = val,
                         "near_clip" => desc.near = val,
                         "far_clip" => desc.far = val,
                         _ => {}
                     }
+                } else if tag.as_ref() == b"string"
+                    && let (Some(name), Some(val)) = (attr_str(e, "name"), attr_str(e, "value"))
+                    && name == "fov_axis"
+                {
+                    desc.fov_axis = val;
                 }
             }
             Event::Start(ref e) => {
@@ -444,8 +455,10 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
                     "transform" => {
                         desc.to_world = parse_transform(reader)?;
                     }
+                    "film" => {
+                        parse_film_into(reader, &mut desc)?;
+                    }
                     _ => {
-                        // Skip film, sampler, etc.
                         let end = e.to_end().into_owned();
                         let mut skip_buf = Vec::new();
                         reader.read_to_end_into(end.name(), &mut skip_buf)?;
@@ -460,6 +473,36 @@ fn parse_sensor(reader: &mut Reader<&[u8]>) -> Result<MitsubaCameraDesc> {
     }
 
     Ok(desc)
+}
+
+/// Parse `<film>` to extract width/height.
+fn parse_film_into(reader: &mut Reader<&[u8]>, desc: &mut MitsubaCameraDesc) -> Result<()> {
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf).context("parse_film")? {
+            Event::Empty(ref e) => {
+                if e.name().as_ref() == b"integer"
+                    && let (Some(name), Some(val)) = (attr_str(e, "name"), attr_str(e, "value"))
+                {
+                    match name.as_str() {
+                        "width"  => { desc.film_width  = val.parse().unwrap_or(desc.film_width); }
+                        "height" => { desc.film_height = val.parse().unwrap_or(desc.film_height); }
+                        _ => {}
+                    }
+                }
+            }
+            Event::Start(ref e) => {
+                let end = e.to_end().into_owned();
+                let mut skip_buf = Vec::new();
+                reader.read_to_end_into(end.name(), &mut skip_buf)?;
+            }
+            Event::End(ref e) if e.name().as_ref() == b"film" => break,
+            Event::Eof => anyhow::bail!("unexpected EOF inside <film>"),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(())
 }
 
 /// Convert Mitsuba camera description to an OrbitalCamera.
@@ -484,7 +527,19 @@ fn camera_from_mitsuba(desc: &MitsubaCameraDesc) -> OrbitalCamera {
     let yaw = offset.x.atan2(offset.z);
 
     let mut cam = OrbitalCamera::new(target, dist, yaw.to_degrees(), pitch.to_degrees());
-    cam.camera.fov_y = desc.fov_y.to_radians();
+
+    // Convert FOV to vertical radians.  Mitsuba's fov_axis defaults to "x" (horizontal).
+    let aspect = desc.film_width as f32 / desc.film_height as f32;
+    let fov_rad = desc.fov.to_radians();
+    let hfov_to_vfov = |h: f32| 2.0 * ((h * 0.5).tan() / aspect).atan();
+    let is_horizontal = match desc.fov_axis.as_str() {
+        "y" => false,
+        "x" | "" => true,
+        "smaller" => aspect < 1.0,  // smaller dim is x when aspect < 1 → fov is horizontal
+        "larger"  => aspect >= 1.0, // larger dim is x when aspect >= 1 → fov is horizontal
+        _ => true,
+    };
+    cam.camera.fov_y = if is_horizontal { hfov_to_vfov(fov_rad) } else { fov_rad };
     cam.camera.near = desc.near;
     cam.camera.far = desc.far;
     cam
@@ -1713,7 +1768,8 @@ mod tests {
             </transform>
         "#).unwrap();
 
-        assert!((desc.fov_y - 60.0).abs() < 1e-6);
+        assert!((desc.fov - 60.0).abs() < 1e-6);
+        assert_eq!(desc.fov_axis, "x"); // default
         assert!((desc.near - 0.1).abs() < 1e-6);
         assert!((desc.far - 500.0).abs() < 1e-6);
 
@@ -1725,6 +1781,11 @@ mod tests {
         assert!((pos.z - 10.0).abs() < 0.01, "z={}", pos.z);
         // Target should be at origin
         assert!(cam.target.length() < 0.01, "target={:?}", cam.target);
+        // FOV should be converted from horizontal (60°) to vertical
+        // With default 768x576 (aspect=4/3): vfov = 2*atan(tan(30°)/1.333) ≈ 46.8°
+        let expected_vfov = 2.0 * ((60f32.to_radians() * 0.5).tan() / (768.0 / 576.0)).atan();
+        assert!((cam.camera.fov_y - expected_vfov).abs() < 0.01,
+            "fov_y={} expected={}", cam.camera.fov_y.to_degrees(), expected_vfov.to_degrees());
     }
 
     fn parse_bsdf_str(xml: &str, bsdf_type: &str) -> Result<MitsubaMaterial> {
