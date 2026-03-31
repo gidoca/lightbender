@@ -18,6 +18,34 @@ use crate::buffer::{upload_to_device_local, GpuBuffer};
 use crate::gpu_scene::{GpuScene, GpuTexture};
 use crate::image::GpuImage;
 
+// ── Embedded built-in shaders (compiled at build time) ─────────────────────
+
+fn bytes_to_spirv(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+fn mesh_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/mesh.vert.spv"))
+}
+fn mesh_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/mesh.frag.spv"))
+}
+fn pbr_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/pbr.vert.spv"))
+}
+fn pbr_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/pbr.frag.spv"))
+}
+fn skybox_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/skybox.vert.spv"))
+}
+fn skybox_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/skybox.frag.spv"))
+}
+
 type SwapchainInfo = (
     vk::SwapchainKHR,
     Vec<vk::Image>,
@@ -2166,10 +2194,8 @@ unsafe fn create_pipeline(
     let (vert_module, frag_module, owned) = if let Some(pair) = shader_pair {
         (pair.vert, pair.frag, false)
     } else {
-        let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.vert.spv"))
-            .context("load vertex shader")?;
-        let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.frag.spv"))
-            .context("load fragment shader")?;
+        let vert_spv = mesh_vert_spv();
+        let frag_spv = mesh_frag_spv();
         let v = device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
             .context("vert shader module")?;
@@ -2279,10 +2305,8 @@ unsafe fn create_pipeline_variants(
     pipeline_layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
 ) -> Result<(vk::Pipeline, vk::Pipeline)> {
-    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/pbr.vert.spv"))
-        .context("load PBR vertex shader")?;
-    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/pbr.frag.spv"))
-        .context("load PBR fragment shader")?;
+    let vert_spv = pbr_vert_spv();
+    let frag_spv = pbr_frag_spv();
     let vert_module = device
         .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)?;
     let frag_module = device
@@ -2389,10 +2413,8 @@ unsafe fn create_skybox_pipeline(
     pipeline_layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
 ) -> Result<vk::Pipeline> {
-    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/skybox.vert.spv"))
-        .context("load skybox vertex shader")?;
-    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/skybox.frag.spv"))
-        .context("load skybox fragment shader")?;
+    let vert_spv = skybox_vert_spv();
+    let frag_spv = skybox_frag_spv();
     let vert_module = device
         .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
         .context("skybox vert shader module")?;
