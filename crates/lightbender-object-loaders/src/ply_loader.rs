@@ -4,10 +4,10 @@ use anyhow::{Context, Result};
 use ply_rs::parser::Parser;
 use ply_rs::ply::{DefaultElement, Property};
 
-use crate::types::GpuVertex;
+use lightbender_scene::{compute_tangents, Vertex};
 
 pub struct PlyMesh {
-    pub vertices: Vec<GpuVertex>,
+    pub vertices: Vec<Vertex>,
     pub indices:  Vec<u32>,
 }
 
@@ -48,7 +48,7 @@ pub fn load_ply(path: &Path) -> Result<PlyMesh> {
                         .or_else(|| prop_f32(elem, "v"))
                         .unwrap_or(0.0);
 
-                    vertices.push(GpuVertex {
+                    vertices.push(Vertex {
                         position: [px, py, pz],
                         normal:   [nx, ny, nz],
                         uv:       [u, v],
@@ -90,8 +90,8 @@ pub fn load_ply(path: &Path) -> Result<PlyMesh> {
         face_indices = (0..vertices.len() as u32).collect();
     }
 
-    // Compute tangents (reuse OBJ loader's approach)
-    crate::scene::obj_loader::compute_tangents(&mut vertices, &face_indices);
+    // Compute tangent vectors from position/UV derivatives
+    compute_tangents(&mut vertices, &face_indices);
 
     Ok(PlyMesh { vertices, indices: face_indices })
 }

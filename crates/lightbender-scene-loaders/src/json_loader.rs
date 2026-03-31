@@ -5,10 +5,9 @@ use anyhow::{Context, Result};
 use glam::{Quat, Vec3};
 use serde::Deserialize;
 
-use super::{gltf_loader, Scene, Transform};
-use crate::renderer::Renderer;
+use lightbender_scene::{Scene, Transform};
 
-// ── JSON schema ───────────────────────────────────────────────────────────────
+// ── JSON schema ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -154,14 +153,14 @@ pub struct EnvironmentDesc {
 
 fn default_ambient() -> f32 { 0.3 }
 
-// ── Loader ────────────────────────────────────────────────────────────────────
+// ── Loader ──────────────────────────────────────────────────────────────────
 
 pub struct LoadedScene {
     pub scene:       Scene,
     pub description: SceneDescription,
 }
 
-pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene> {
+pub fn load_json_scene(scene_path: &Path) -> Result<LoadedScene> {
     let json = std::fs::read_to_string(scene_path)
         .with_context(|| format!("read scene file: {}", scene_path.display()))?;
     let desc: SceneDescription =
@@ -170,7 +169,6 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
     let base = scene_path.parent().unwrap_or(Path::new("."));
 
     // Load and merge all models into a single scene
-    let ctx = renderer.load_context();
     let mut merged: Option<Scene> = None;
     let mut node_offset = 0usize;
     let mut mesh_offset  = 0usize;
@@ -178,7 +176,7 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
 
     for model_desc in &desc.models {
         let model_path = resolve_path(base, &model_desc.path);
-        let mut sub = gltf_loader::load(&ctx, &model_path)
+        let mut sub = lightbender_object_loaders::load_gltf(&model_path)
             .with_context(|| format!("load model: {}", model_path.display()))?;
 
         // Apply the model's shader to all its materials
@@ -238,27 +236,7 @@ pub fn load_scene(renderer: &Renderer, scene_path: &Path) -> Result<LoadedScene>
     }
 
     // If no models were specified, create an empty scene
-    let scene = match merged {
-        Some(s) => s,
-        None => {
-            let pool = unsafe {
-                renderer.device().create_descriptor_pool(
-                    &ash::vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&[]),
-                    None,
-                ).context("create empty scene descriptor pool")?
-            };
-            Scene {
-                nodes: vec![],
-                meshes: vec![],
-                materials: vec![],
-                textures: vec![],
-                world_transforms: vec![],
-                descriptor_pool: pool,
-            }
-        }
-    };
+    let scene = merged.unwrap_or_default();
 
     Ok(LoadedScene { scene, description: desc })
 }
@@ -280,7 +258,7 @@ mod tests {
 
     use super::*;
 
-    // ── resolve_path ──────────────────────────────────────────────────────────
+    // ── resolve_path ────────────────────────────────────────────────────────
 
     #[test]
     fn resolve_path_absolute_passthrough() {
@@ -296,7 +274,7 @@ mod tests {
         assert_eq!(result, PathBuf::from("/scene/dir/models/thing.glb"));
     }
 
-    // ── compose_transforms ────────────────────────────────────────────────────
+    // ── compose_transforms ──────────────────────────────────────────────────
 
     #[test]
     fn compose_transforms_both_identity() {

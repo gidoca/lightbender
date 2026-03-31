@@ -980,22 +980,80 @@ name = "lightbender"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ash",
- "ash-window",
- "bytemuck",
  "env_logger",
+ "glam",
+ "image",
+ "lightbender-interaction",
+ "lightbender-object-loaders",
+ "lightbender-renderer",
+ "lightbender-scene",
+ "lightbender-scene-loaders",
+ "log",
+ "serde_json",
+ "tempfile",
+ "winit",
+]
+
+[[package]]
+name = "lightbender-interaction"
+version = "0.1.0"
+dependencies = [
+ "glam",
+]
+
+[[package]]
+name = "lightbender-object-loaders"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "glam",
  "gltf",
  "image",
+ "lightbender-scene",
  "log",
  "ply-rs",
- "quick-xml 0.37.5",
+ "tobj",
+]
+
+[[package]]
+name = "lightbender-renderer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "ash-window",
+ "bytemuck",
+ "glam",
+ "image",
+ "lightbender-interaction",
+ "lightbender-scene",
+ "log",
  "raw-window-handle",
+ "tempfile",
+ "winit",
+]
+
+[[package]]
+name = "lightbender-scene"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "serde",
+]
+
+[[package]]
+name = "lightbender-scene-loaders"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "lightbender-object-loaders",
+ "lightbender-scene",
+ "log",
+ "quick-xml 0.37.5",
  "serde",
  "serde_json",
- "tempfile",
- "tobj",
- "winit",
 ]
 
 [[package]]

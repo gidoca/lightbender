@@ -16,8 +16,8 @@
   ],
   "shaders": {
     "pbr": {
-      "vert": "../shaders/compiled/pbr.vert.spv",
-      "frag": "../shaders/compiled/pbr.frag.spv"
+      "vert": "../crates/lightbender-renderer/shaders/compiled/pbr.vert.spv",
+      "frag": "../crates/lightbender-renderer/shaders/compiled/pbr.frag.spv"
     }
   },
   "models": [

@@ -8,12 +8,43 @@ use ash::vk;
 use glam::Mat4;
 use winit::window::Window;
 
-use crate::camera::Camera;
-use crate::scene::{gltf_loader::LoadContext, GpuTexture, Scene};
-use crate::shader::ShaderPair;
-use crate::types::{FrameUniforms, GpuLight, GpuVertex, MaterialPushConstants, MAX_LIGHTS};
-use crate::vulkan::buffer::{upload_to_device_local, GpuBuffer};
-use crate::vulkan::image::GpuImage;
+use lightbender_interaction::Camera;
+use lightbender_scene::{
+    FrameUniforms, GpuLight, Light, MaterialPushConstants, Scene, TextureData, TextureFormat,
+    Vertex, MAX_LIGHTS,
+};
+
+use crate::buffer::{upload_to_device_local, GpuBuffer};
+use crate::gpu_scene::{GpuScene, GpuTexture};
+use crate::image::GpuImage;
+
+// ── Embedded built-in shaders (compiled at build time) ─────────────────────
+
+fn bytes_to_spirv(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+fn mesh_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/mesh.vert.spv"))
+}
+fn mesh_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/mesh.frag.spv"))
+}
+fn pbr_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/pbr.vert.spv"))
+}
+fn pbr_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/pbr.frag.spv"))
+}
+fn skybox_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/skybox.vert.spv"))
+}
+fn skybox_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/skybox.frag.spv"))
+}
 
 type SwapchainInfo = (
     vk::SwapchainKHR,
@@ -75,7 +106,7 @@ pub struct Renderer {
     /// Set 0: per-frame UBO
     descriptor_set_layout: vk::DescriptorSetLayout,
     /// Set 1: per-material textures (5× combined image samplers)
-    pub material_set_layout: vk::DescriptorSetLayout,
+    material_set_layout: vk::DescriptorSetLayout,
     /// Set 2: environment map (1× combined image sampler)
     env_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
@@ -104,10 +135,13 @@ pub struct Renderer {
     env_descriptor_pool: vk::DescriptorPool,
     env_descriptor_sets: Vec<vk::DescriptorSet>,
 
-    // Mesh geometry
+    // Fallback cube mesh
     vertex_buffer: GpuBuffer,
     index_buffer: GpuBuffer,
     index_count: u32,
+
+    // Uploaded GPU scene (None if no scene loaded)
+    gpu_scene: Option<GpuScene>,
 
     in_flight: Vec<vk::Fence>,
     current_frame: usize,
@@ -159,7 +193,7 @@ impl Renderer {
             required_exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
 
-        // MoltenVK requires portability enumeration to discover non-conformant devices
+        // MoltenVK requires portability enumeration
         let available_instance_exts = entry.enumerate_instance_extension_properties(None)?;
         let has_portability_enumeration = available_instance_exts.iter().any(|e| {
             e.extension_name_as_c_str()
@@ -170,7 +204,6 @@ impl Renderer {
         if has_portability_enumeration {
             required_exts.push(ash::khr::portability_enumeration::NAME.as_ptr());
             instance_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-            // Required by VK_KHR_portability_subset on the device side
             let has_props2 = available_instance_exts.iter().any(|e| {
                 e.extension_name_as_c_str()
                     .map(|n| n == ash::khr::get_physical_device_properties2::NAME)
@@ -252,8 +285,6 @@ impl Renderer {
         }
 
         let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
-
-        // MoltenVK devices expose portability_subset — must enable it if present
         let dev_ext_props =
             instance.enumerate_device_extension_properties(physical_device)?;
         let has_portability_subset = dev_ext_props.iter().any(|e| {
@@ -291,41 +322,26 @@ impl Renderer {
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let (swapchain, swapchain_images, swapchain_image_views, swapchain_format, swapchain_extent) =
             create_swapchain(
-                &device,
-                physical_device,
-                &surface_loader,
-                surface,
-                graphics_family,
-                present_family,
-                &swapchain_loader,
-                vk::SwapchainKHR::null(),
-                &window,
+                &device, physical_device, &surface_loader, surface,
+                graphics_family, present_family, &swapchain_loader,
+                vk::SwapchainKHR::null(), &window,
             )?;
 
         // --- Depth image ---
         let (depth_image, depth_image_memory, depth_image_view) = create_depth_image(
-            &device,
-            &instance,
-            physical_device,
-            swapchain_extent,
-            command_pool,
-            graphics_queue,
+            &device, &instance, physical_device, swapchain_extent, command_pool, graphics_queue,
         )?;
 
         // --- Render pass ---
         let render_pass =
             create_render_pass(&device, swapchain_format, vk::ImageLayout::PRESENT_SRC_KHR).context("render pass")?;
 
-        // --- Descriptor set layout (set 0: frame UBO) ---
+        // --- Descriptor set layouts ---
         let descriptor_set_layout = create_descriptor_set_layout(&device)?;
-
-        // --- Descriptor set layout (set 1: material textures) ---
         let material_set_layout = create_material_set_layout(&device)?;
-
-        // --- Descriptor set layout (set 2: environment map) ---
         let env_set_layout = create_env_set_layout(&device)?;
 
-        // --- Pipeline cache (load from disk if available) ---
+        // --- Pipeline cache ---
         let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
         let pipeline_cache = device.create_pipeline_cache(
             &vk::PipelineCacheCreateInfo::default().initial_data(&cache_data),
@@ -349,18 +365,13 @@ impl Renderer {
         pipelines.insert("__double_sided".to_string(), double_sided);
         pipelines.insert("__transparent".to_string(), transparent);
 
-        // --- Skybox pipeline ---
         let skybox_pipeline = create_skybox_pipeline(
             &device, render_pass, pipeline_layout, pipeline_cache,
         ).context("skybox pipeline")?;
 
         // --- Framebuffers ---
         let framebuffers = create_framebuffers(
-            &device,
-            render_pass,
-            &swapchain_image_views,
-            depth_image_view,
-            swapchain_extent,
+            &device, render_pass, &swapchain_image_views, depth_image_view, swapchain_extent,
         )?;
 
         // --- Command buffers ---
@@ -378,10 +389,7 @@ impl Renderer {
         let mut ubo_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for _ in 0..FRAMES_IN_FLIGHT {
             ubo_buffers.push(GpuBuffer::new(
-                &device,
-                &instance,
-                physical_device,
-                ubo_size,
+                &device, &instance, physical_device, ubo_size,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )?);
@@ -466,7 +474,6 @@ impl Renderer {
             )
             .context("env descriptor sets")?;
 
-        // Bind fallback texture to all env descriptor sets
         for &ds in &env_descriptor_sets {
             let image_info = [vk::DescriptorImageInfo {
                 sampler: env_fallback_texture.sampler,
@@ -484,52 +491,33 @@ impl Renderer {
         // --- Hardcoded cube mesh ---
         let (vertices, indices) = cube_mesh();
         let vertex_buffer = upload_to_device_local(
-            &device,
-            &instance,
-            physical_device,
-            command_pool,
-            graphics_queue,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            &vertices,
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            vk::BufferUsageFlags::VERTEX_BUFFER, &vertices,
         )?;
         let index_buffer = upload_to_device_local(
-            &device,
-            &instance,
-            physical_device,
-            command_pool,
-            graphics_queue,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            &indices,
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            vk::BufferUsageFlags::INDEX_BUFFER, &indices,
         )?;
         let index_count = indices.len() as u32;
 
         // --- Sync ---
-        // One semaphore per swapchain image to avoid reuse conflicts with the
-        // presentation engine (which holds semaphore refs until re-acquire)
         let mut image_available = Vec::with_capacity(swapchain_images.len());
         let mut render_finished = Vec::with_capacity(swapchain_images.len());
         for _ in 0..swapchain_images.len() {
             image_available.push(
-                device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                    .context("semaphore")?,
+                device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).context("semaphore")?,
             );
             render_finished.push(
-                device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                    .context("semaphore")?,
+                device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).context("semaphore")?,
             );
         }
         let mut in_flight = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for _ in 0..FRAMES_IN_FLIGHT {
             in_flight.push(
-                device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default()
-                            .flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .context("fence")?,
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                ).context("fence")?,
             );
         }
 
@@ -590,6 +578,7 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             index_count,
+            gpu_scene: None,
             in_flight,
             current_frame: 0,
             last_image_index: 0,
@@ -599,7 +588,6 @@ impl Renderer {
     unsafe fn init_offscreen(width: u32, height: u32) -> Result<Self> {
         let entry = ash::Entry::load().context("load Vulkan — is a Vulkan driver installed?")?;
 
-        // --- Instance (no window extensions) ---
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"lightbender")
             .application_version(vk::make_api_version(0, 0, 1, 0))
@@ -628,7 +616,6 @@ impl Renderer {
             required_exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
 
-        // MoltenVK portability
         let available_instance_exts = entry.enumerate_instance_extension_properties(None)?;
         let has_portability_enumeration = available_instance_exts.iter().any(|e| {
             e.extension_name_as_c_str()
@@ -665,7 +652,6 @@ impl Renderer {
             .create_instance(&instance_info, None)
             .context("create instance")?;
 
-        // --- Debug messenger ---
         #[cfg(debug_assertions)]
         let (debug_utils, debug_messenger) = if enable_validation {
             let du = ash::ext::debug_utils::Instance::new(&entry, &instance);
@@ -691,10 +677,8 @@ impl Renderer {
             )
         };
 
-        // --- Physical device (headless — no surface) ---
         let (physical_device, graphics_family) = pick_physical_device_headless(&instance)?;
 
-        // --- Logical device (no swapchain extension) ---
         let queue_priorities = [1.0f32];
         let queue_infos = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(graphics_family)
@@ -723,7 +707,6 @@ impl Renderer {
             .context("create device")?;
         let graphics_queue = device.get_device_queue(graphics_family, 0);
 
-        // --- Command pool ---
         let command_pool = device
             .create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -733,7 +716,6 @@ impl Renderer {
             )
             .context("command pool")?;
 
-        // --- Offscreen color image ---
         let swapchain_format = vk::Format::B8G8R8A8_SRGB;
         let swapchain_extent = vk::Extent2D { width, height };
 
@@ -753,10 +735,8 @@ impl Renderer {
         ).context("create offscreen color image")?;
 
         let mem_reqs = device.get_image_memory_requirements(color_image);
-        let mem_type = crate::vulkan::buffer::find_memory_type(
-            &instance,
-            physical_device,
-            mem_reqs.memory_type_bits,
+        let mem_type = crate::buffer::find_memory_type(
+            &instance, physical_device, mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
         let color_image_memory = device.allocate_memory(
@@ -786,29 +766,24 @@ impl Renderer {
         let swapchain_images = vec![color_image];
         let swapchain_image_views = vec![color_image_view];
 
-        // --- Depth image ---
         let (depth_image, depth_image_memory, depth_image_view) = create_depth_image(
             &device, &instance, physical_device, swapchain_extent, command_pool, graphics_queue,
         )?;
 
-        // --- Render pass (COLOR_ATTACHMENT_OPTIMAL final layout for offscreen) ---
         let render_pass =
             create_render_pass(&device, swapchain_format, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .context("render pass")?;
 
-        // --- Descriptor set layouts ---
         let descriptor_set_layout = create_descriptor_set_layout(&device)?;
         let material_set_layout = create_material_set_layout(&device)?;
         let env_set_layout = create_env_set_layout(&device)?;
 
-        // --- Pipeline cache ---
         let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
         let pipeline_cache = device.create_pipeline_cache(
             &vk::PipelineCacheCreateInfo::default().initial_data(&cache_data),
             None,
         ).context("pipeline cache")?;
 
-        // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
             create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None, None)
                 .context("pipeline")?;
@@ -820,17 +795,14 @@ impl Renderer {
         pipelines.insert("__double_sided".to_string(), double_sided);
         pipelines.insert("__transparent".to_string(), transparent);
 
-        // --- Skybox pipeline ---
         let skybox_pipeline = create_skybox_pipeline(
             &device, render_pass, pipeline_layout, pipeline_cache,
         ).context("skybox pipeline")?;
 
-        // --- Framebuffers ---
         let framebuffers = create_framebuffers(
             &device, render_pass, &swapchain_image_views, depth_image_view, swapchain_extent,
         )?;
 
-        // --- Command buffers (just 1 for offscreen) ---
         let command_buffers = device
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -840,7 +812,6 @@ impl Renderer {
             )
             .context("command buffers")?;
 
-        // --- Per-frame UBO (just 1) ---
         let ubo_size = std::mem::size_of::<FrameUniforms>() as vk::DeviceSize;
         let ubo_buffers = vec![GpuBuffer::new(
             &device, &instance, physical_device, ubo_size,
@@ -848,7 +819,6 @@ impl Renderer {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?];
 
-        // --- Descriptor pool + sets ---
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::UNIFORM_BUFFER,
             descriptor_count: 1,
@@ -885,7 +855,6 @@ impl Renderer {
             device.update_descriptor_sets(&[write], &[]);
         }
 
-        // --- Environment map fallback + descriptor sets ---
         let env_fallback_pixels: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
         let env_fallback_image = GpuImage::upload_rgba32f(
             &device, &instance, physical_device, command_pool, graphics_queue,
@@ -941,7 +910,6 @@ impl Renderer {
             device.update_descriptor_sets(&[write], &[]);
         }
 
-        // --- Hardcoded cube mesh ---
         let (vertices, indices) = cube_mesh();
         let vertex_buffer = upload_to_device_local(
             &device, &instance, physical_device, command_pool, graphics_queue,
@@ -953,7 +921,6 @@ impl Renderer {
         )?;
         let index_count = indices.len() as u32;
 
-        // --- Sync (just 1 fence) ---
         let in_flight = vec![device
             .create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -1010,17 +977,44 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             index_count,
+            gpu_scene: None,
             in_flight,
             current_frame: 0,
             last_image_index: 0,
         })
     }
 
-    pub fn draw_frame(&mut self, camera: &Camera, scene: Option<&Scene>) -> Result<()> {
-        unsafe { self.draw_frame_inner(camera, scene) }
+    // ── Scene management ────────────────────────────────────────────────────
+
+    /// Upload a CPU-side scene to the GPU. Replaces any previously uploaded scene.
+    pub fn upload_scene(&mut self, scene: &Scene) -> Result<()> {
+        unsafe {
+            self.device.device_wait_idle()?;
+            self.clear_scene();
+            let gpu_scene = GpuScene::upload(
+                &self.device, &self.instance, self.physical_device,
+                self.command_pool, self.graphics_queue,
+                self.material_set_layout, scene,
+            )?;
+            self.gpu_scene = Some(gpu_scene);
+        }
+        Ok(())
     }
 
-    unsafe fn draw_frame_inner(&mut self, camera: &Camera, scene: Option<&Scene>) -> Result<()> {
+    /// Destroy the currently uploaded GPU scene.
+    pub fn clear_scene(&mut self) {
+        if let Some(scene) = self.gpu_scene.take() {
+            unsafe { scene.destroy(&self.device); }
+        }
+    }
+
+    // ── Drawing ─────────────────────────────────────────────────────────────
+
+    pub fn draw_frame(&mut self, camera: &Camera) -> Result<()> {
+        unsafe { self.draw_frame_inner(camera) }
+    }
+
+    unsafe fn draw_frame_inner(&mut self, camera: &Camera) -> Result<()> {
         let RenderTarget::Window {
             ref window,
             ref swapchain_loader,
@@ -1042,17 +1036,14 @@ impl Renderer {
 
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
-            return Ok(()); // minimized — nothing to draw
+            return Ok(());
         }
 
         let acquire_sem = image_available[*next_semaphore];
         *next_semaphore = (*next_semaphore + 1) % image_available.len();
 
         let (image_index, suboptimal) = match swapchain_loader.acquire_next_image(
-            swapchain,
-            u64::MAX,
-            acquire_sem,
-            vk::Fence::null(),
+            swapchain, u64::MAX, acquire_sem, vk::Fence::null(),
         ) {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -1068,13 +1059,12 @@ impl Renderer {
         self.device.reset_fences(&[self.in_flight[frame]])?;
         self.last_image_index = image_index as usize;
 
-        // Update UBO
         self.update_ubo(frame, camera)?;
 
         let cmd = self.command_buffers[frame];
         self.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-        self.record_commands(cmd, image_index as usize, frame, scene)?;
+        self.record_commands(cmd, image_index as usize, frame)?;
 
         let wait_semaphores = [acquire_sem];
         let signal_semaphores = [render_finished[image_index as usize]];
@@ -1116,15 +1106,11 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn draw_frame_offscreen(&mut self, camera: &Camera, scene: Option<&Scene>) -> Result<()> {
-        unsafe { self.draw_frame_offscreen_inner(camera, scene) }
+    pub fn draw_frame_offscreen(&mut self, camera: &Camera) -> Result<()> {
+        unsafe { self.draw_frame_offscreen_inner(camera) }
     }
 
-    unsafe fn draw_frame_offscreen_inner(
-        &mut self,
-        camera: &Camera,
-        scene: Option<&Scene>,
-    ) -> Result<()> {
+    unsafe fn draw_frame_offscreen_inner(&mut self, camera: &Camera) -> Result<()> {
         assert!(matches!(self.render_target, RenderTarget::Offscreen { .. }));
 
         let frame = 0;
@@ -1138,7 +1124,7 @@ impl Renderer {
         let cmd = self.command_buffers[frame];
         self.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-        self.record_commands(cmd, 0, frame, scene)?;
+        self.record_commands(cmd, 0, frame)?;
 
         let command_buffers_arr = [cmd];
         let submit_info = vk::SubmitInfo::default()
@@ -1147,7 +1133,6 @@ impl Renderer {
         self.device
             .queue_submit(self.graphics_queue, &[submit_info], self.in_flight[frame])?;
 
-        // Wait for rendering to complete so capture can read the image
         self.device
             .wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)?;
 
@@ -1185,7 +1170,6 @@ impl Renderer {
         cmd: vk::CommandBuffer,
         image_index: usize,
         frame: usize,
-        scene: Option<&Scene>,
     ) -> Result<()> {
         self.device.begin_command_buffer(
             cmd,
@@ -1222,12 +1206,10 @@ impl Renderer {
         let mut bound_pipeline = vk::Pipeline::null();
 
         let viewport = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
+            x: 0.0, y: 0.0,
             width: self.swapchain_extent.width as f32,
             height: self.swapchain_extent.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
+            min_depth: 0.0, max_depth: 1.0,
         };
         self.device.cmd_set_viewport(cmd, 0, &[viewport]);
         let scissor = vk::Rect2D {
@@ -1238,22 +1220,14 @@ impl Renderer {
 
         // Bind frame descriptor set (set 0)
         self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            self.pipeline_layout,
-            0,
-            &[self.descriptor_sets[frame]],
-            &[],
+            cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
+            0, &[self.descriptor_sets[frame]], &[],
         );
 
         // Bind environment map descriptor set (set 2)
         self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            self.pipeline_layout,
-            2,
-            &[self.env_descriptor_sets[frame]],
-            &[],
+            cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
+            2, &[self.env_descriptor_sets[frame]], &[],
         );
 
         // Draw skybox if environment map is loaded
@@ -1262,22 +1236,19 @@ impl Renderer {
             self.device.cmd_draw(cmd, 3, 1, 0, 0);
         }
 
-        if let Some(scene) = scene {
+        if let Some(scene) = &self.gpu_scene {
             let double_sided_pipeline = self.pipelines.get("__double_sided").copied();
             let transparent_pipeline = self.pipelines.get("__transparent").copied();
 
-            // Collect draw calls, separating opaque and transparent
             let primitives: Vec<_> = scene.draw_primitives().collect();
             let (opaque, transparent): (Vec<_>, Vec<_>) = primitives.iter().partition(|(_, prim)| {
                 let mat = &scene.materials[prim.material];
                 mat.base_color_factor[3] >= 1.0
             });
 
-            // Draw opaque primitives first, then transparent
             for (world, prim) in opaque.iter().chain(transparent.iter()) {
                 let mat = &scene.materials[prim.material];
 
-                // Select pipeline: custom > double-sided > transparent > default
                 let is_transparent = mat.base_color_factor[3] < 1.0;
                 let pipeline = if let Some(name) = mat.pipeline_name.as_deref() {
                     self.pipelines.get(name).copied().unwrap_or(default_pipeline)
@@ -1293,24 +1264,17 @@ impl Renderer {
                     bound_pipeline = pipeline;
                 }
 
-                // Bind material descriptor set (set 1)
                 self.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
-                    1,
-                    &[mat.descriptor_set],
-                    &[],
+                    cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
+                    1, &[mat.descriptor_set], &[],
                 );
 
                 let model_arr = world.to_cols_array_2d();
                 let model_bytes = bytemuck::bytes_of(&model_arr);
                 self.device.cmd_push_constants(
-                    cmd,
-                    self.pipeline_layout,
+                    cmd, self.pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    model_bytes,
+                    0, model_bytes,
                 );
 
                 let mat_push = MaterialPushConstants {
@@ -1321,11 +1285,9 @@ impl Renderer {
                     _pad:              [0.0; 3],
                 };
                 self.device.cmd_push_constants(
-                    cmd,
-                    self.pipeline_layout,
+                    cmd, self.pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    64,
-                    bytemuck::bytes_of(&mat_push),
+                    64, bytemuck::bytes_of(&mat_push),
                 );
 
                 self.device.cmd_bind_vertex_buffers(cmd, 0, &[prim.vertex_buffer.buffer], &[0]);
@@ -1338,11 +1300,9 @@ impl Renderer {
             let model_arr = Mat4::IDENTITY.to_cols_array_2d();
             let model_bytes = bytemuck::bytes_of(&model_arr);
             self.device.cmd_push_constants(
-                cmd,
-                self.pipeline_layout,
+                cmd, self.pipeline_layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                model_bytes,
+                0, model_bytes,
             );
             let default_mat = MaterialPushConstants {
                 base_color_factor: [1.0, 1.0, 1.0, 1.0],
@@ -1352,11 +1312,9 @@ impl Renderer {
                 _pad:              [0.0; 3],
             };
             self.device.cmd_push_constants(
-                cmd,
-                self.pipeline_layout,
+                cmd, self.pipeline_layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                64,
-                bytemuck::bytes_of(&default_mat),
+                64, bytemuck::bytes_of(&default_mat),
             );
             self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.buffer], &[0]);
             self.device.cmd_bind_index_buffer(cmd, self.index_buffer.buffer, 0, vk::IndexType::UINT32);
@@ -1368,19 +1326,33 @@ impl Renderer {
         Ok(())
     }
 
-    /// Build and register a named pipeline from an already-loaded shader pair.
-    pub fn add_pipeline(&mut self, name: &str, pair: &ShaderPair) -> Result<()> {
+    // ── Pipeline management ─────────────────────────────────────────────────
+
+    /// Build and register a named pipeline from SPIR-V shader code.
+    pub fn add_pipeline_spirv(
+        &mut self,
+        name: &str,
+        vert_spv: &[u32],
+        frag_spv: &[u32],
+    ) -> Result<()> {
         unsafe {
+            let vert = self.device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vert_spv), None)
+                .context("vert shader module")?;
+            let frag = self.device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(frag_spv), None)
+                .context("frag shader module")?;
+
+            let pair = ShaderPair { vert, frag };
             let (_layout, pipeline) = create_pipeline(
-                &self.device,
-                self.render_pass,
-                self.descriptor_set_layout,
-                self.material_set_layout,
-                self.env_set_layout,
-                self.pipeline_cache,
-                Some(pair),
-                Some(self.pipeline_layout),
+                &self.device, self.render_pass,
+                self.descriptor_set_layout, self.material_set_layout, self.env_set_layout,
+                self.pipeline_cache, Some(&pair), Some(self.pipeline_layout),
             )?;
+
+            self.device.destroy_shader_module(vert, None);
+            self.device.destroy_shader_module(frag, None);
+
             if let Some(old) = self.pipelines.insert(name.to_string(), pipeline) {
                 self.device.destroy_pipeline(old, None);
             }
@@ -1388,41 +1360,27 @@ impl Renderer {
         }
     }
 
-    pub fn device(&self) -> &ash::Device {
-        &self.device
+    // ── Lights & environment ────────────────────────────────────────────────
+
+    pub fn set_lights(&mut self, lights: Vec<Light>) {
+        self.lights = lights.iter().map(|l| l.to_gpu()).collect();
     }
 
-    pub fn device_wait_idle(&self) -> Result<()> {
-        unsafe { Ok(self.device.device_wait_idle()?) }
-    }
-
-    /// Return a LoadContext for the glTF loader to use.
-    pub fn load_context(&self) -> LoadContext<'_> {
-        LoadContext {
-            device:              &self.device,
-            instance:            &self.instance,
-            physical_device:     self.physical_device,
-            command_pool:        self.command_pool,
-            queue:               self.graphics_queue,
-            material_set_layout: self.material_set_layout,
-        }
-    }
-
-    /// Set the environment map texture and IBL intensity. Updates all env descriptor sets.
-    pub fn set_lights(&mut self, lights: Vec<GpuLight>) {
-        self.lights = lights;
-    }
-
-    pub fn set_environment_map(&mut self, texture: GpuTexture, intensity: f32) -> Result<()> {
+    /// Set the environment map from CPU-side texture data.
+    pub fn set_environment_map(&mut self, texture_data: &TextureData, intensity: f32) -> Result<()> {
         self.env_intensity = intensity;
         unsafe {
             self.device.device_wait_idle()?;
 
-            // Update descriptor sets to point to the new texture
+            let gpu_tex = upload_env_texture(
+                &self.device, &self.instance, self.physical_device,
+                self.command_pool, self.graphics_queue, texture_data,
+            )?;
+
             for &ds in &self.env_descriptor_sets {
                 let image_info = [vk::DescriptorImageInfo {
-                    sampler: texture.sampler,
-                    image_view: texture.image.view,
+                    sampler: gpu_tex.sampler,
+                    image_view: gpu_tex.image.view,
                     image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 }];
                 let write = vk::WriteDescriptorSet::default()
@@ -1433,18 +1391,23 @@ impl Renderer {
                 self.device.update_descriptor_sets(&[write], &[]);
             }
 
-            // Destroy old env texture if any
             if let Some(old) = self.env_texture.take() {
                 old.destroy(&self.device);
             }
 
-            self.env_texture = Some(texture);
+            self.env_texture = Some(gpu_tex);
         }
         Ok(())
     }
 
+    // ── Window management ───────────────────────────────────────────────────
+
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         unsafe { self.rebuild_swapchain(width, height) }
+    }
+
+    pub fn device_wait_idle(&self) -> Result<()> {
+        unsafe { Ok(self.device.device_wait_idle()?) }
     }
 
     /// Copy the most recently rendered swapchain image to a file.
@@ -1453,7 +1416,7 @@ impl Renderer {
     }
 
     unsafe fn capture_frame_to_file_inner(&self, path: &std::path::Path) -> Result<()> {
-        use crate::vulkan::buffer::{begin_one_shot, end_one_shot, find_memory_type};
+        use crate::buffer::{begin_one_shot, end_one_shot, find_memory_type};
 
         self.device.device_wait_idle()?;
 
@@ -1461,7 +1424,6 @@ impl Renderer {
         let height = self.swapchain_extent.height;
         let image_size = (width * height * 4) as vk::DeviceSize;
 
-        // Create host-visible staging buffer
         let buffer_info = vk::BufferCreateInfo::default()
             .size(image_size)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
@@ -1471,9 +1433,7 @@ impl Renderer {
 
         let mem_reqs = self.device.get_buffer_memory_requirements(buffer);
         let mem_type = find_memory_type(
-            &self.instance,
-            self.physical_device,
-            mem_reqs.memory_type_bits,
+            &self.instance, self.physical_device, mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         ).context("find host-visible memory type")?;
         let alloc_info = vk::MemoryAllocateInfo::default()
@@ -1483,7 +1443,6 @@ impl Renderer {
             .context("allocate staging memory")?;
         self.device.bind_buffer_memory(buffer, buffer_memory, 0)?;
 
-        // Record copy commands
         let src_image = self.swapchain_images[self.last_image_index];
         let cmd = begin_one_shot(&self.device, self.command_pool)?;
 
@@ -1498,7 +1457,6 @@ impl Renderer {
             ),
         };
 
-        // Transition image to TRANSFER_SRC
         let barrier_to_src = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_READ)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1515,37 +1473,25 @@ impl Renderer {
                 layer_count: 1,
             });
         self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[], &[],
-            &[barrier_to_src],
+            cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(), &[], &[], &[barrier_to_src],
         );
 
-        // Copy image to buffer
         let region = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: 0,
             buffer_image_height: 0,
             image_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
+                mip_level: 0, base_array_layer: 0, layer_count: 1,
             },
             image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
             image_extent: vk::Extent3D { width, height, depth: 1 },
         };
         self.device.cmd_copy_image_to_buffer(
-            cmd,
-            src_image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            buffer,
-            &[region],
+            cmd, src_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region],
         );
 
-        // Transition image back to original layout
         let barrier_back = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_READ)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ)
@@ -1556,30 +1502,21 @@ impl Renderer {
             .image(src_image)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
+                base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1,
             });
         self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &[], &[],
-            &[barrier_back],
+            cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::DependencyFlags::empty(), &[], &[], &[barrier_back],
         );
 
         end_one_shot(&self.device, self.command_pool, self.graphics_queue, cmd)?;
 
-        // Read pixels from staging buffer
         let data_ptr = self.device.map_memory(buffer_memory, 0, image_size, vk::MemoryMapFlags::empty())
             .context("map staging buffer")?;
         let mut pixels = vec![0u8; image_size as usize];
         std::ptr::copy_nonoverlapping(data_ptr as *const u8, pixels.as_mut_ptr(), pixels.len());
         self.device.unmap_memory(buffer_memory);
 
-        // Swap B and R channels if swapchain format is BGRA
         let is_bgra = matches!(
             self.swapchain_format,
             vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM
@@ -1590,11 +1527,9 @@ impl Renderer {
             }
         }
 
-        // Clean up staging buffer
         self.device.destroy_buffer(buffer, None);
         self.device.free_memory(buffer_memory, None);
 
-        // Save image
         image::save_buffer(path, &pixels, width, height, image::ColorType::Rgba8)
             .context("save image file")?;
 
@@ -1635,15 +1570,9 @@ impl Renderer {
 
         let old_swapchain = *swapchain;
         let (new_swapchain, images, image_views, format, extent) = create_swapchain(
-            &self.device,
-            self.physical_device,
-            surface_loader,
-            surface,
-            self.graphics_family,
-            present_family,
-            swapchain_loader,
-            old_swapchain,
-            window,
+            &self.device, self.physical_device, surface_loader, surface,
+            self.graphics_family, present_family, swapchain_loader,
+            old_swapchain, window,
         )?;
         swapchain_loader.destroy_swapchain(old_swapchain, None);
 
@@ -1652,7 +1581,6 @@ impl Renderer {
         self.swapchain_format = format;
         self.swapchain_extent = extent;
 
-        // Rebuild semaphores if swapchain image count changed
         if images.len() != self.swapchain_images.len() {
             for sem in image_available.drain(..) {
                 self.device.destroy_semaphore(sem, None);
@@ -1662,13 +1590,11 @@ impl Renderer {
             }
             for _ in 0..images.len() {
                 image_available.push(
-                    self.device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                         .context("semaphore")?,
                 );
                 render_finished.push(
-                    self.device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                         .context("semaphore")?,
                 );
             }
@@ -1677,23 +1603,16 @@ impl Renderer {
         self.swapchain_images = images;
 
         let (di, dim, div) = create_depth_image(
-            &self.device,
-            &self.instance,
-            self.physical_device,
-            extent,
-            self.command_pool,
-            self.graphics_queue,
+            &self.device, &self.instance, self.physical_device,
+            extent, self.command_pool, self.graphics_queue,
         )?;
         self.depth_image = di;
         self.depth_image_memory = dim;
         self.depth_image_view = div;
 
         self.framebuffers = create_framebuffers(
-            &self.device,
-            self.render_pass,
-            &self.swapchain_image_views,
-            self.depth_image_view,
-            self.swapchain_extent,
+            &self.device, self.render_pass, &self.swapchain_image_views,
+            self.depth_image_view, self.swapchain_extent,
         )?;
 
         Ok(())
@@ -1704,6 +1623,11 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+
+            // Destroy uploaded scene first
+            if let Some(scene) = self.gpu_scene.take() {
+                scene.destroy(&self.device);
+            }
 
             match &self.render_target {
                 RenderTarget::Window {
@@ -1741,7 +1665,6 @@ impl Drop for Renderer {
             self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_descriptor_set_layout(self.material_set_layout, None);
 
-            // Environment map cleanup
             if let Some(env_tex) = &self.env_texture {
                 env_tex.destroy(&self.device);
             }
@@ -1768,7 +1691,6 @@ impl Drop for Renderer {
             self.device.destroy_pipeline(self.skybox_pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
 
-            // Save pipeline cache to disk for faster startup next time
             match self.device.get_pipeline_cache_data(self.pipeline_cache) {
                 Ok(data) => {
                     if let Err(e) = std::fs::write(PIPELINE_CACHE_FILE, &data) {
@@ -1809,7 +1731,53 @@ impl Drop for Renderer {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Internal helper types ───────────────────────────────────────────────────
+
+struct ShaderPair {
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
+}
+
+// ── Environment map upload ──────────────────────────────────────────────────
+
+unsafe fn upload_env_texture(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    texture_data: &TextureData,
+) -> Result<GpuTexture> {
+    let image = match texture_data.format {
+        TextureFormat::Rgba8 => {
+            GpuImage::upload_rgba8(
+                device, instance, physical_device, command_pool, queue,
+                texture_data.width, texture_data.height, &texture_data.pixels,
+            ).context("upload environment map")?
+        }
+        TextureFormat::Rgba32F => {
+            let floats: &[f32] = bytemuck::cast_slice(&texture_data.pixels);
+            GpuImage::upload_rgba32f(
+                device, instance, physical_device, command_pool, queue,
+                texture_data.width, texture_data.height, floats,
+            ).context("upload environment map")?
+        }
+    };
+
+    let sampler = device.create_sampler(
+        &vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+        None,
+    ).context("create env map sampler")?;
+
+    Ok(GpuTexture { image, sampler })
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 unsafe fn pick_physical_device(
     instance: &ash::Instance,
@@ -2056,10 +2024,8 @@ unsafe fn create_depth_image(
         .context("create depth image")?;
 
     let req = device.get_image_memory_requirements(image);
-    let mem_type = crate::vulkan::buffer::find_memory_type(
-        instance,
-        physical_device,
-        req.memory_type_bits,
+    let mem_type = crate::buffer::find_memory_type(
+        instance, physical_device, req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
     let memory = device
@@ -2072,8 +2038,7 @@ unsafe fn create_depth_image(
         .context("depth image memory")?;
     device.bind_image_memory(image, memory, 0)?;
 
-    // Transition to depth attachment layout
-    let cmd = crate::vulkan::buffer::begin_one_shot(device, command_pool)?;
+    let cmd = crate::buffer::begin_one_shot(device, command_pool)?;
     let barrier = vk::ImageMemoryBarrier::default()
         .old_layout(vk::ImageLayout::UNDEFINED)
         .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
@@ -2082,23 +2047,15 @@ unsafe fn create_depth_image(
         .image(image)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::DEPTH,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
+            base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1,
         })
         .src_access_mask(vk::AccessFlags::empty())
         .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
     device.cmd_pipeline_barrier(
-        cmd,
-        vk::PipelineStageFlags::TOP_OF_PIPE,
-        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-        vk::DependencyFlags::empty(),
-        &[],
-        &[],
-        &[barrier],
+        cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        vk::DependencyFlags::empty(), &[], &[], &[barrier],
     );
-    crate::vulkan::buffer::end_one_shot(device, command_pool, queue, cmd)?;
+    crate::buffer::end_one_shot(device, command_pool, queue, cmd)?;
 
     let view = device
         .create_image_view(
@@ -2108,10 +2065,7 @@ unsafe fn create_depth_image(
                 .format(format)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::DEPTH,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
+                    base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1,
                 }),
             None,
         )
@@ -2126,7 +2080,6 @@ unsafe fn create_render_pass(
     color_final_layout: vk::ImageLayout,
 ) -> Result<vk::RenderPass> {
     let attachments = [
-        // Color
         vk::AttachmentDescription::default()
             .format(color_format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -2136,7 +2089,6 @@ unsafe fn create_render_pass(
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(color_final_layout),
-        // Depth
         vk::AttachmentDescription::default()
             .format(vk::Format::D32_SFLOAT)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -2201,7 +2153,6 @@ unsafe fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::Descr
 }
 
 unsafe fn create_material_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-    // 5 combined image samplers: base_color, normal, metallic_roughness, occlusion, emissive
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..5u32)
         .map(|i| {
             vk::DescriptorSetLayoutBinding::default()
@@ -2217,6 +2168,18 @@ unsafe fn create_material_set_layout(device: &ash::Device) -> Result<vk::Descrip
     )?)
 }
 
+unsafe fn create_env_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+    Ok(device.create_descriptor_set_layout(
+        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+        None,
+    )?)
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_pipeline(
     device: &ash::Device,
@@ -2225,19 +2188,14 @@ unsafe fn create_pipeline(
     material_set_layout: vk::DescriptorSetLayout,
     env_set_layout: vk::DescriptorSetLayout,
     pipeline_cache: vk::PipelineCache,
-    // Pre-loaded shader modules to use. If None, loads the built-in mesh shaders.
     shader_pair: Option<&ShaderPair>,
-    // If provided, reuse this layout instead of creating a new one.
     existing_layout: Option<vk::PipelineLayout>,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
-    // Either use provided modules or load the built-in mesh shaders
     let (vert_module, frag_module, owned) = if let Some(pair) = shader_pair {
         (pair.vert, pair.frag, false)
     } else {
-        let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.vert.spv"))
-            .context("load vertex shader")?;
-        let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/mesh.frag.spv"))
-            .context("load fragment shader")?;
+        let vert_spv = mesh_vert_spv();
+        let frag_spv = mesh_frag_spv();
         let v = device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
             .context("vert shader module")?;
@@ -2261,25 +2219,13 @@ unsafe fn create_pipeline(
 
     let vertex_binding = vk::VertexInputBindingDescription::default()
         .binding(0)
-        .stride(std::mem::size_of::<GpuVertex>() as u32)
+        .stride(std::mem::size_of::<Vertex>() as u32)
         .input_rate(vk::VertexInputRate::VERTEX);
     let vertex_attrs = [
-        vk::VertexInputAttributeDescription {
-            location: 0, binding: 0,
-            format: vk::Format::R32G32B32_SFLOAT, offset: 0,
-        },
-        vk::VertexInputAttributeDescription {
-            location: 1, binding: 0,
-            format: vk::Format::R32G32B32_SFLOAT, offset: 12,
-        },
-        vk::VertexInputAttributeDescription {
-            location: 2, binding: 0,
-            format: vk::Format::R32G32_SFLOAT, offset: 24,
-        },
-        vk::VertexInputAttributeDescription {
-            location: 3, binding: 0,
-            format: vk::Format::R32G32B32A32_SFLOAT, offset: 32,
-        },
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 12 },
+        vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 24 },
+        vk::VertexInputAttributeDescription { location: 3, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 32 },
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(std::slice::from_ref(&vertex_binding))
@@ -2287,36 +2233,26 @@ unsafe fn create_pipeline(
 
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-
+        .viewport_count(1).scissor_count(1);
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::BACK)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
-
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(true)
-        .depth_write_enable(true)
-        .depth_compare_op(vk::CompareOp::LESS)
-        .depth_bounds_test_enable(false);
-
+        .depth_test_enable(true).depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS);
     let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)
-        .blend_enable(false);
+        .color_write_mask(vk::ColorComponentFlags::RGBA);
     let blend_attachments = [blend_attachment];
-    let color_blend =
-        vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(&blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic_state =
-        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+        .dynamic_states(&dynamic_states);
 
     let layout = if let Some(layout) = existing_layout {
         layout
@@ -2325,7 +2261,7 @@ unsafe fn create_pipeline(
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(64 + std::mem::size_of::<MaterialPushConstants>() as u32); // mat4 + material factors
+            .size(64 + std::mem::size_of::<MaterialPushConstants>() as u32);
         device
             .create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -2355,7 +2291,6 @@ unsafe fn create_pipeline(
         .map_err(|(_, e)| e)
         .context("graphics pipeline")?;
 
-    // Only destroy modules we created ourselves (not caller-owned ones)
     if owned {
         device.destroy_shader_module(vert_module, None);
         device.destroy_shader_module(frag_module, None);
@@ -2364,17 +2299,14 @@ unsafe fn create_pipeline(
     Ok((layout, pipelines[0]))
 }
 
-/// Create pipeline variants (double-sided, transparent) from the PBR shaders.
 unsafe fn create_pipeline_variants(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
 ) -> Result<(vk::Pipeline, vk::Pipeline)> {
-    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/pbr.vert.spv"))
-        .context("load PBR vertex shader")?;
-    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/pbr.frag.spv"))
-        .context("load PBR fragment shader")?;
+    let vert_spv = pbr_vert_spv();
+    let frag_spv = pbr_frag_spv();
     let vert_module = device
         .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)?;
     let frag_module = device
@@ -2383,18 +2315,13 @@ unsafe fn create_pipeline_variants(
     let entry_point = c"main";
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vert_module)
-            .name(entry_point),
+            .stage(vk::ShaderStageFlags::VERTEX).module(vert_module).name(entry_point),
         vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(frag_module)
-            .name(entry_point),
+            .stage(vk::ShaderStageFlags::FRAGMENT).module(frag_module).name(entry_point),
     ];
 
     let vertex_binding = vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(std::mem::size_of::<GpuVertex>() as u32)
+        .binding(0).stride(std::mem::size_of::<Vertex>() as u32)
         .input_rate(vk::VertexInputRate::VERTEX);
     let vertex_attrs = [
         vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
@@ -2418,7 +2345,7 @@ unsafe fn create_pipeline_variants(
     let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
         .dynamic_states(&dynamic_states);
 
-    // ── Double-sided pipeline (cull_mode = NONE) ─────────────────────────
+    // Double-sided pipeline (cull_mode = NONE)
     let rasterization_ds = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::NONE)
@@ -2441,14 +2368,14 @@ unsafe fn create_pipeline_variants(
         .create_graphics_pipelines(pipeline_cache, &[ds_info], None)
         .map_err(|(_, e)| e).context("double-sided pipeline")?[0];
 
-    // ── Transparent pipeline (alpha blending, no depth write) ────────────
+    // Transparent pipeline (alpha blending, no depth write)
     let rasterization_tr = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
     let depth_stencil_tr = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(true).depth_write_enable(false) // no depth write for transparency
+        .depth_test_enable(true).depth_write_enable(false)
         .depth_compare_op(vk::CompareOp::LESS);
     let blend_transparent = [vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::RGBA)
@@ -2480,28 +2407,14 @@ unsafe fn create_pipeline_variants(
     Ok((double_sided_pipeline, transparent_pipeline))
 }
 
-unsafe fn create_env_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-    let bindings = [vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-    Ok(device.create_descriptor_set_layout(
-        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-        None,
-    )?)
-}
-
 unsafe fn create_skybox_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
 ) -> Result<vk::Pipeline> {
-    let vert_spv = load_spirv(std::path::Path::new("shaders/compiled/skybox.vert.spv"))
-        .context("load skybox vertex shader")?;
-    let frag_spv = load_spirv(std::path::Path::new("shaders/compiled/skybox.frag.spv"))
-        .context("load skybox fragment shader")?;
+    let vert_spv = skybox_vert_spv();
+    let frag_spv = skybox_frag_spv();
     let vert_module = device
         .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
         .context("skybox vert shader module")?;
@@ -2512,50 +2425,34 @@ unsafe fn create_skybox_pipeline(
     let entry_point = c"main";
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vert_module)
-            .name(entry_point),
+            .stage(vk::ShaderStageFlags::VERTEX).module(vert_module).name(entry_point),
         vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(frag_module)
-            .name(entry_point),
+            .stage(vk::ShaderStageFlags::FRAGMENT).module(frag_module).name(entry_point),
     ];
 
-    // No vertex input for fullscreen triangle
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-
+        .viewport_count(1).scissor_count(1);
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
-
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-    // Depth test enabled (LESS_OR_EQUAL to pass at z=1.0), but no depth write
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(true)
-        .depth_write_enable(false)
-        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
-        .depth_bounds_test_enable(false);
-
+        .depth_test_enable(true).depth_write_enable(false)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
     let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::RGBA);
     let blend_attachments = [blend_attachment];
-    let color_blend =
-        vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(&blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic_state =
-        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+        .dynamic_states(&dynamic_states);
 
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
@@ -2608,6 +2505,7 @@ unsafe fn create_framebuffers(
         .collect()
 }
 
+/// Load and validate a SPIR-V binary from disk.
 pub fn load_spirv(path: &std::path::Path) -> Result<Vec<u32>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("read SPIR-V: {}", path.display()))?;
@@ -2621,19 +2519,16 @@ pub fn load_spirv(path: &std::path::Path) -> Result<Vec<u32>> {
 }
 
 /// Hardcoded unit cube with per-face normals.
-fn cube_mesh() -> (Vec<GpuVertex>, Vec<u32>) {
-    // 6 faces × 4 vertices = 24 vertices
+fn cube_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let faces: [([f32; 3], [f32; 3]); 6] = [
-        // (normal, +axis offset)
-        ([0.0, 0.0,  1.0], [0.0, 0.0,  1.0]), // front  +Z
-        ([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]), // back   -Z
-        ([1.0, 0.0,  0.0], [1.0, 0.0,  0.0]), // right  +X
-        ([-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]), // left   -X
-        ([0.0,  1.0, 0.0], [0.0,  1.0, 0.0]), // top    +Y
-        ([0.0, -1.0, 0.0], [0.0, -1.0, 0.0]), // bottom -Y
+        ([0.0, 0.0,  1.0], [0.0, 0.0,  1.0]),
+        ([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]),
+        ([1.0, 0.0,  0.0], [1.0, 0.0,  0.0]),
+        ([-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ([0.0,  1.0, 0.0], [0.0,  1.0, 0.0]),
+        ([0.0, -1.0, 0.0], [0.0, -1.0, 0.0]),
     ];
 
-    // Local 2D corners (tangent / bitangent)
     let corners: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
     let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
 
@@ -2642,24 +2537,20 @@ fn cube_mesh() -> (Vec<GpuVertex>, Vec<u32>) {
 
     for (face_idx, (normal, center)) in faces.iter().enumerate() {
         let n = glam::Vec3::from(*normal);
-        // Choose tangent: for Y-faces use X, otherwise use Y
         let up = if n.y.abs() > 0.9 { glam::Vec3::Z } else { glam::Vec3::Y };
         let tangent = n.cross(up).normalize();
         let bitangent = n.cross(tangent).normalize();
 
         let base = face_idx as u32 * 4;
         for (i, corner) in corners.iter().enumerate() {
-            let pos = glam::Vec3::from(*center)
-                + tangent * corner[0]
-                + bitangent * corner[1];
-            vertices.push(GpuVertex {
+            let pos = glam::Vec3::from(*center) + tangent * corner[0] + bitangent * corner[1];
+            vertices.push(Vertex {
                 position: pos.to_array(),
                 normal: *normal,
                 uv: uvs[i],
                 tangent: [tangent.x, tangent.y, tangent.z, 1.0],
             });
         }
-        // Two CCW triangles per face
         indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
     }
 

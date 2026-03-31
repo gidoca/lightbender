@@ -2,7 +2,7 @@ use std::f32::consts::FRAC_PI_2;
 
 use glam::Vec3;
 
-use super::Camera;
+use crate::camera::Camera;
 use crate::input::InputState;
 
 pub struct OrbitalCamera {

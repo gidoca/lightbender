@@ -1,6 +1,3 @@
-mod orbital;
-pub use orbital::OrbitalCamera;
-
 use glam::{Mat4, Vec3};
 
 pub struct Camera {
