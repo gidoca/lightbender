@@ -11,7 +11,6 @@ members = [
 name = "lightbender"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [dependencies]
 lightbender-scene = { path = "crates/lightbender-scene" }
@@ -19,24 +18,15 @@ lightbender-interaction = { path = "crates/lightbender-interaction" }
 lightbender-object-loaders = { path = "crates/lightbender-object-loaders" }
 lightbender-scene-loaders = { path = "crates/lightbender-scene-loaders" }
 lightbender-renderer = { path = "crates/lightbender-renderer" }
-ash            = "0.38"
-ash-window     = "0.13"
-raw-window-handle = "0.6"
 winit          = { version = "0.30", features = ["rwh_06"] }
 glam           = { version = "0.29", features = ["serde"] }
-gltf           = { version = "1.4", features = ["extras", "names", "utils"] }
-image          = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
-serde          = { version = "1", features = ["derive"] }
-serde_json     = "1"
 log            = "0.4"
 env_logger     = "0.11"
 anyhow         = "1"
-bytemuck       = { version = "1", features = ["derive"] }
-quick-xml      = "0.37"
-tobj           = "4"
-ply-rs         = "0.1"
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde_json = "1"
 tempfile = "3"
 
 [profile.dev]

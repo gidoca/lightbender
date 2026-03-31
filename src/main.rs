@@ -1,17 +1,9 @@
-
 mod app;
-mod camera;
-mod input;
-mod renderer;
-mod scene;
-mod shader;
-mod types;
-mod vulkan;
 
 use std::path::PathBuf;
 
-use app::{load_scene_from_input, App, InputPath};
-use renderer::Renderer;
+use app::{load_scene_into_renderer, App, InputPath};
+use lightbender_renderer::Renderer;
 use winit::event_loop::EventLoop;
 
 fn print_help() {
@@ -63,16 +55,10 @@ fn main() -> anyhow::Result<()> {
     if let Some(output_path) = output_path {
         // Headless path: render to file without creating a window
         let mut renderer = Renderer::new_offscreen(1280, 720)?;
-        let (scene, camera) = load_scene_from_input(&mut renderer, input_path.as_ref())?;
-        renderer.draw_frame_offscreen(&camera.camera, scene.as_ref())?;
+        let camera = load_scene_into_renderer(&mut renderer, input_path.as_ref())?;
+        renderer.draw_frame_offscreen(&camera.camera)?;
         renderer.capture_frame_to_file(&output_path)?;
         log::info!("Saved output to {}", output_path.display());
-        if let Some(scene) = scene {
-            unsafe {
-                let _ = renderer.device_wait_idle();
-                scene.destroy(renderer.device());
-            }
-        }
         return Ok(());
     }
 

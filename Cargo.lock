@@ -980,12 +980,8 @@ name = "lightbender"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ash",
- "ash-window",
- "bytemuck",
  "env_logger",
  "glam",
- "gltf",
  "image",
  "lightbender-interaction",
  "lightbender-object-loaders",
@@ -993,13 +989,8 @@ dependencies = [
  "lightbender-scene",
  "lightbender-scene-loaders",
  "log",
- "ply-rs",
- "quick-xml 0.37.5",
- "raw-window-handle",
- "serde",
  "serde_json",
  "tempfile",
- "tobj",
  "winit",
 ]
 
