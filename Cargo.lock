@@ -989,6 +989,7 @@ dependencies = [
  "image",
  "lightbender-interaction",
  "lightbender-object-loaders",
+ "lightbender-renderer",
  "lightbender-scene",
  "lightbender-scene-loaders",
  "log",
@@ -1021,6 +1022,24 @@ dependencies = [
  "log",
  "ply-rs",
  "tobj",
+]
+
+[[package]]
+name = "lightbender-renderer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "ash-window",
+ "bytemuck",
+ "glam",
+ "image",
+ "lightbender-interaction",
+ "lightbender-scene",
+ "log",
+ "raw-window-handle",
+ "tempfile",
+ "winit",
 ]
 
 [[package]]
