@@ -1,0 +1,90 @@
+{
+  "camera": {
+    "target":   [0.0, 0.6, 0.0],
+    "distance": 7.0,
+    "yaw":      -25.0,
+    "pitch":    20.0,
+    "fov_y":    50.0,
+    "near":     0.01,
+    "far":      1000.0
+  },
+  "lights": [
+    {
+      "type":      "directional",
+      "name":      "sun",
+      "direction": [-0.5, -0.8, -0.3],
+      "color":     [1.0, 0.95, 0.85],
+      "intensity": 4.0
+    }
+  ],
+  "shaders": {
+    "pbr": {
+      "vert": "../crates/lightbender-renderer/shaders/compiled/pbr.vert.spv",
+      "frag": "../crates/lightbender-renderer/shaders/compiled/pbr.frag.spv"
+    }
+  },
+  "models": [
+    {
+      "name":    "ground",
+      "path":    "./assets/Box.glb",
+      "shader":  "pbr",
+      "transform": {
+        "translation": [0.0, -0.05, 0.0],
+        "scale":       [12.0, 0.05, 12.0]
+      }
+    },
+    {
+      "name":    "duck",
+      "path":    "../../glTF-Sample-Models/2.0/Duck/glTF-Binary/Duck.glb",
+      "shader":  "pbr",
+      "transform": {
+        "translation": [-2.0, 0.0, 0.5],
+        "rotation":    [0.0, 0.259, 0.0, 0.966],
+        "scale":       [0.015, 0.015, 0.015]
+      }
+    },
+    {
+      "name":    "helmet",
+      "path":    "./assets/DamagedHelmet.glb",
+      "shader":  "pbr",
+      "transform": {
+        "translation": [0.0, 1.3, 0.0],
+        "rotation":    [0.0, 0.3827, 0.0, 0.9239],
+        "scale":       [0.8, 0.8, 0.8]
+      }
+    },
+    {
+      "name":    "tall_box",
+      "path":    "./assets/Box.glb",
+      "shader":  "pbr",
+      "transform": {
+        "translation": [2.5, 1.0, -0.5],
+        "scale":       [0.5, 1.0, 0.5]
+      }
+    },
+    {
+      "name":    "small_box",
+      "path":    "./assets/Box.glb",
+      "shader":  "pbr",
+      "transform": {
+        "translation": [1.2, 0.3, 1.5],
+        "rotation":    [0.0, 0.383, 0.0, 0.924],
+        "scale":       [0.3, 0.3, 0.3]
+      }
+    },
+    {
+      "name":    "water_bottle",
+      "path":    "../../glTF-Sample-Models/2.0/WaterBottle/glTF-Binary/WaterBottle.glb",
+      "shader":  "pbr",
+      "transform": {
+        "translation": [-0.8, 0.0, 2.0],
+        "scale":       [7.0, 7.0, 7.0]
+      }
+    }
+  ],
+  "environment": {
+    "ambient_color":     [0.05, 0.05, 0.1],
+    "ambient_intensity": 0.15,
+    "background_color":  [0.15, 0.18, 0.25]
+  }
+}

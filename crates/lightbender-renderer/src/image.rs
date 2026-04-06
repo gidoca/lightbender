@@ -195,6 +195,27 @@ pub fn transition_layout(
     src_access: vk::AccessFlags,
     dst_access: vk::AccessFlags,
 ) {
+    transition_layout_ex(
+        device, cmd, image, old_layout, new_layout,
+        src_stage, dst_stage, src_access, dst_access,
+        vk::ImageAspectFlags::COLOR, 1,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn transition_layout_ex(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+    aspect_mask: vk::ImageAspectFlags,
+    layer_count: u32,
+) {
     let barrier = vk::ImageMemoryBarrier::default()
         .old_layout(old_layout)
         .new_layout(new_layout)
@@ -202,11 +223,11 @@ pub fn transition_layout(
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count,
         })
         .src_access_mask(src_access)
         .dst_access_mask(dst_access);

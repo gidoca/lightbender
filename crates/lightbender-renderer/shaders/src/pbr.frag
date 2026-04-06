@@ -13,7 +13,9 @@ struct GpuLight {
     float range;
     float _pad0;
     vec2  spotAngles;
-    vec4  _pad1;
+    int   shadowVPIndex;
+    float shadowBias;
+    vec2  _pad1;
 };
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
@@ -23,6 +25,9 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     GpuLight lights[8];
     uint     lightCount;
     float    envIntensity;
+    uint     shadowCount;
+    uint     _pad;
+    mat4     shadowVP[4];
 } frame;
 
 // Material textures (set 1)
@@ -34,6 +39,9 @@ layout(set = 1, binding = 4) uniform sampler2D texEmissive;
 
 // Environment map (set 2)
 layout(set = 2, binding = 0) uniform sampler2D envMap;
+
+// Shadow map array (set 3)
+layout(set = 3, binding = 0) uniform sampler2DArray shadowMap;
 
 // Material factors (push constants, offset 64)
 layout(push_constant) uniform MaterialFactors {
@@ -73,6 +81,32 @@ vec2 directionToEquirect(vec3 dir) {
     float phi   = atan(dir.z, dir.x);
     float theta = asin(clamp(dir.y, -1.0, 1.0));
     return vec2(phi / (2.0 * PI) + 0.5, -theta / PI + 0.5);
+}
+
+float sampleShadow(uint lightIdx, vec3 worldPos) {
+    int vpIdx = frame.lights[lightIdx].shadowVPIndex;
+    if (vpIdx < 0) return 1.0;
+
+    vec4 lsPos = frame.shadowVP[vpIdx] * vec4(worldPos, 1.0);
+    vec3 proj = lsPos.xyz / lsPos.w;
+    // Vulkan clip: x,y in [-1,1], z in [0,1]
+    vec2 uv = proj.xy * 0.5 + 0.5;
+
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z > 1.0)
+        return 1.0;
+
+    float bias = 0.005;
+
+    // 3×3 PCF with manual depth comparison
+    float shadow = 0.0;
+    vec2 texelSize = 1.0 / vec2(textureSize(shadowMap, 0).xy);
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            float depth = texture(shadowMap, vec3(uv + vec2(x, y) * texelSize, float(vpIdx))).r;
+            shadow += (proj.z - bias > depth) ? 0.0 : 1.0;
+        }
+    }
+    return shadow / 9.0;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -176,7 +210,8 @@ void main() {
 
         vec3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
         vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
-        Lo += (kD * albedo / PI + specular) * radiance * NdotL;
+        float shadow = sampleShadow(i, fragWorldPos);
+        Lo += (kD * albedo / PI + specular) * radiance * NdotL * shadow;
     }
 
     // Image-based lighting (IBL) from environment map
