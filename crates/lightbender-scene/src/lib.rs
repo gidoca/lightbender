@@ -22,7 +22,7 @@ pub struct Vertex {
 /// A single light packed for the UBO.
 /// Layout matches GLSL std140: struct alignment rounded to 16 → 64 bytes each.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GpuLight {
     /// xyz = direction (w=0) or position (w=1 point, w=2 spot)
     pub position_or_direction: [f32; 4], // offset  0
@@ -31,10 +31,23 @@ pub struct GpuLight {
     pub range:       f32,                // offset 32
     pub _pad0:       f32,                // offset 36  (align vec2 to 8)
     pub spot_angles: [f32; 2],           // offset 40
-    pub _pad1:       [f32; 4],           // offset 48  (pad to 64)
+    /// Index into FrameUniforms::shadow_vp (-1 = no shadow).
+    pub shadow_vp_index: i32,            // offset 48
+    pub shadow_bias:     f32,            // offset 52
+    pub _pad1:           [f32; 2],       // offset 56  (pad to 64)
+}
+
+impl Default for GpuLight {
+    fn default() -> Self {
+        Self {
+            shadow_vp_index: -1,
+            ..bytemuck::Zeroable::zeroed()
+        }
+    }
 }
 
 pub const MAX_LIGHTS: usize = 8;
+pub const MAX_SHADOW_CASTERS: usize = 4;
 
 /// Per-frame uniform buffer (set 0, binding 0).
 #[repr(C)]
@@ -46,7 +59,9 @@ pub struct FrameUniforms {
     pub lights:          [GpuLight; MAX_LIGHTS],
     pub light_count:     u32,
     pub env_intensity:   f32,
-    pub _pad:            [u32; 2],
+    pub shadow_count:    u32,
+    pub _pad:            u32,
+    pub shadow_vp:       [[[f32; 4]; 4]; MAX_SHADOW_CASTERS],
 }
 
 /// Material factors pushed alongside the model matrix (push constants).
@@ -215,7 +230,9 @@ impl Light {
             range:       self.range,
             _pad0:       0.0,
             spot_angles: self.spot_angles,
-            _pad1:       [0.0; 4],
+            shadow_vp_index: -1,
+            shadow_bias:     0.005,
+            _pad1:           [0.0; 2],
         }
     }
 }

@@ -11,12 +11,12 @@ use winit::window::Window;
 use lightbender_interaction::Camera;
 use lightbender_scene::{
     FrameUniforms, GpuLight, Light, MaterialPushConstants, Scene, TextureData, TextureFormat,
-    Vertex, MAX_LIGHTS,
+    Vertex, MAX_LIGHTS, MAX_SHADOW_CASTERS,
 };
 
-use crate::buffer::{upload_to_device_local, GpuBuffer};
+use crate::buffer::{find_memory_type as find_mem_type, upload_to_device_local, GpuBuffer};
 use crate::gpu_scene::{GpuScene, GpuTexture};
-use crate::image::GpuImage;
+use crate::image::{transition_layout_ex, GpuImage};
 
 // ── Embedded built-in shaders (compiled at build time) ─────────────────────
 
@@ -44,6 +44,9 @@ fn skybox_vert_spv() -> Vec<u32> {
 }
 fn skybox_frag_spv() -> Vec<u32> {
     bytes_to_spirv(include_bytes!("../shaders/compiled/skybox.frag.spv"))
+}
+fn shadow_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/shadow.vert.spv"))
 }
 
 type SwapchainInfo = (
@@ -142,6 +145,22 @@ pub struct Renderer {
 
     // Uploaded GPU scene (None if no scene loaded)
     gpu_scene: Option<GpuScene>,
+
+    // Shadow mapping
+    shadow_render_pass: vk::RenderPass,
+    shadow_pipeline: vk::Pipeline,
+    shadow_pipeline_layout: vk::PipelineLayout,
+    shadow_map_image: vk::Image,
+    shadow_map_memory: vk::DeviceMemory,
+    shadow_map_view: vk::ImageView,
+    shadow_map_layer_views: Vec<vk::ImageView>,
+    shadow_map_framebuffers: Vec<vk::Framebuffer>,
+    shadow_map_sampler: vk::Sampler,
+    shadow_set_layout: vk::DescriptorSetLayout,
+    shadow_descriptor_pool: vk::DescriptorPool,
+    shadow_descriptor_sets: Vec<vk::DescriptorSet>,
+    shadow_vp_matrices: [glam::Mat4; MAX_SHADOW_CASTERS],
+    shadow_active_count: u32,
 
     in_flight: Vec<vk::Fence>,
     current_frame: usize,
@@ -340,6 +359,7 @@ impl Renderer {
         let descriptor_set_layout = create_descriptor_set_layout(&device)?;
         let material_set_layout = create_material_set_layout(&device)?;
         let env_set_layout = create_env_set_layout(&device)?;
+        let shadow_set_layout = create_shadow_set_layout(&device)?;
 
         // --- Pipeline cache ---
         let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
@@ -355,7 +375,7 @@ impl Renderer {
 
         // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None, None)
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, shadow_set_layout, pipeline_cache, None, None)
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
@@ -368,6 +388,12 @@ impl Renderer {
         let skybox_pipeline = create_skybox_pipeline(
             &device, render_pass, pipeline_layout, pipeline_cache,
         ).context("skybox pipeline")?;
+
+        // --- Shadow mapping ---
+        let shadow = create_shadow_resources(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            pipeline_cache, shadow_set_layout,
+        ).context("shadow resources")?;
 
         // --- Framebuffers ---
         let framebuffers = create_framebuffers(
@@ -579,6 +605,20 @@ impl Renderer {
             index_buffer,
             index_count,
             gpu_scene: None,
+            shadow_render_pass: shadow.render_pass,
+            shadow_pipeline: shadow.pipeline,
+            shadow_pipeline_layout: shadow.pipeline_layout,
+            shadow_map_image: shadow.map_image,
+            shadow_map_memory: shadow.map_memory,
+            shadow_map_view: shadow.map_view,
+            shadow_map_layer_views: shadow.layer_views,
+            shadow_map_framebuffers: shadow.framebuffers,
+            shadow_map_sampler: shadow.sampler,
+            shadow_set_layout: shadow.set_layout,
+            shadow_descriptor_pool: shadow.descriptor_pool,
+            shadow_descriptor_sets: shadow.descriptor_sets,
+            shadow_vp_matrices: [glam::Mat4::IDENTITY; MAX_SHADOW_CASTERS],
+            shadow_active_count: 0,
             in_flight,
             current_frame: 0,
             last_image_index: 0,
@@ -777,6 +817,7 @@ impl Renderer {
         let descriptor_set_layout = create_descriptor_set_layout(&device)?;
         let material_set_layout = create_material_set_layout(&device)?;
         let env_set_layout = create_env_set_layout(&device)?;
+        let shadow_set_layout = create_shadow_set_layout(&device)?;
 
         let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
         let pipeline_cache = device.create_pipeline_cache(
@@ -785,7 +826,7 @@ impl Renderer {
         ).context("pipeline cache")?;
 
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, pipeline_cache, None, None)
+            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, shadow_set_layout, pipeline_cache, None, None)
                 .context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
@@ -798,6 +839,12 @@ impl Renderer {
         let skybox_pipeline = create_skybox_pipeline(
             &device, render_pass, pipeline_layout, pipeline_cache,
         ).context("skybox pipeline")?;
+
+        // --- Shadow mapping ---
+        let shadow = create_shadow_resources(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            pipeline_cache, shadow_set_layout,
+        ).context("shadow resources")?;
 
         let framebuffers = create_framebuffers(
             &device, render_pass, &swapchain_image_views, depth_image_view, swapchain_extent,
@@ -978,6 +1025,20 @@ impl Renderer {
             index_buffer,
             index_count,
             gpu_scene: None,
+            shadow_render_pass: shadow.render_pass,
+            shadow_pipeline: shadow.pipeline,
+            shadow_pipeline_layout: shadow.pipeline_layout,
+            shadow_map_image: shadow.map_image,
+            shadow_map_memory: shadow.map_memory,
+            shadow_map_view: shadow.map_view,
+            shadow_map_layer_views: shadow.layer_views,
+            shadow_map_framebuffers: shadow.framebuffers,
+            shadow_map_sampler: shadow.sampler,
+            shadow_set_layout: shadow.set_layout,
+            shadow_descriptor_pool: shadow.descriptor_pool,
+            shadow_descriptor_sets: shadow.descriptor_sets,
+            shadow_vp_matrices: [glam::Mat4::IDENTITY; MAX_SHADOW_CASTERS],
+            shadow_active_count: 0,
             in_flight,
             current_frame: 0,
             last_image_index: 0,
@@ -1059,7 +1120,9 @@ impl Renderer {
         self.device.reset_fences(&[self.in_flight[frame]])?;
         self.last_image_index = image_index as usize;
 
-        self.update_ubo(frame, camera)?;
+        let (shadow_vps, shadow_count) = self.update_ubo(frame, camera)?;
+        self.shadow_vp_matrices = shadow_vps;
+        self.shadow_active_count = shadow_count;
 
         let cmd = self.command_buffers[frame];
         self.device
@@ -1119,7 +1182,9 @@ impl Renderer {
         self.device.reset_fences(&[self.in_flight[frame]])?;
 
         self.last_image_index = 0;
-        self.update_ubo(frame, camera)?;
+        let (shadow_vps, shadow_count) = self.update_ubo(frame, camera)?;
+        self.shadow_vp_matrices = shadow_vps;
+        self.shadow_active_count = shadow_count;
 
         let cmd = self.command_buffers[frame];
         self.device
@@ -1139,7 +1204,7 @@ impl Renderer {
         Ok(())
     }
 
-    unsafe fn update_ubo(&self, frame: usize, camera: &Camera) -> Result<()> {
+    unsafe fn update_ubo(&self, frame: usize, camera: &Camera) -> Result<([glam::Mat4; MAX_SHADOW_CASTERS], u32)> {
         let extent = self.swapchain_extent;
         let aspect = extent.width as f32 / extent.height as f32;
 
@@ -1153,6 +1218,50 @@ impl Renderer {
             lights_arr[i] = *light;
         }
 
+        // Compute shadow VP matrices for shadow-casting lights
+        let mut shadow_vp_mats = [glam::Mat4::IDENTITY; MAX_SHADOW_CASTERS];
+        let mut shadow_count = 0u32;
+
+        for light in lights_arr.iter_mut().take(count) {
+            let light_type = light.position_or_direction[3];
+            if shadow_count as usize >= MAX_SHADOW_CASTERS {
+                break;
+            }
+
+            if light_type < 0.5 {
+                // Directional light: orthographic projection
+                let dir = glam::Vec3::from_slice(&light.position_or_direction[..3]).normalize();
+                let light_pos = -dir * 50.0;
+                let up = if dir.y.abs() > 0.99 { glam::Vec3::X } else { glam::Vec3::Y };
+                let light_view = glam::Mat4::look_at_rh(light_pos, glam::Vec3::ZERO, up);
+                let light_proj = glam::Mat4::orthographic_rh(-20.0, 20.0, -20.0, 20.0, 0.1, 100.0);
+                shadow_vp_mats[shadow_count as usize] = light_proj * light_view;
+                light.shadow_vp_index = shadow_count as i32;
+                shadow_count += 1;
+            } else if light_type > 1.5 {
+                // Spot light: perspective projection using outer cone angle
+                let pos = glam::Vec3::from_slice(&light.position_or_direction[..3]);
+                let cos_outer = light.spot_angles[1];
+                let fov = cos_outer.acos() * 2.0;
+                let up = if light.position_or_direction[1].abs() > 0.99 {
+                    glam::Vec3::X
+                } else {
+                    glam::Vec3::Y
+                };
+                let light_view = glam::Mat4::look_at_rh(pos, glam::Vec3::ZERO, up);
+                let light_proj = glam::Mat4::perspective_rh(fov, 1.0, 0.1, light.range.max(1.0));
+                shadow_vp_mats[shadow_count as usize] = light_proj * light_view;
+                light.shadow_vp_index = shadow_count as i32;
+                shadow_count += 1;
+            }
+            // Point lights (w=1) skip shadow mapping (would need cubemap)
+        }
+
+        let mut shadow_vp = [[[0.0f32; 4]; 4]; MAX_SHADOW_CASTERS];
+        for (i, m) in shadow_vp_mats.iter().enumerate() {
+            shadow_vp[i] = m.to_cols_array_2d();
+        }
+
         let uniforms = FrameUniforms {
             view: view.to_cols_array_2d(),
             projection: proj.to_cols_array_2d(),
@@ -1160,9 +1269,12 @@ impl Renderer {
             lights: lights_arr,
             light_count: count as u32,
             env_intensity: self.env_intensity,
-            _pad: [0; 2],
+            shadow_count,
+            _pad: 0,
+            shadow_vp,
         };
-        self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))
+        self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))?;
+        Ok((shadow_vp_mats, shadow_count))
     }
 
     unsafe fn record_commands(
@@ -1177,6 +1289,71 @@ impl Renderer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
 
+        // ── Shadow depth pass ──────────────────────────────────────────────
+        if self.shadow_active_count > 0
+            && let Some(scene) = &self.gpu_scene
+        {
+                let shadow_viewport = vk::Viewport {
+                    x: 0.0, y: 0.0,
+                    width: SHADOW_MAP_SIZE as f32,
+                    height: SHADOW_MAP_SIZE as f32,
+                    min_depth: 0.0, max_depth: 1.0,
+                };
+                let shadow_scissor = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE },
+                };
+
+                for i in 0..self.shadow_active_count as usize {
+                    let shadow_clear = [vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                    }];
+                    let shadow_rp_begin = vk::RenderPassBeginInfo::default()
+                        .render_pass(self.shadow_render_pass)
+                        .framebuffer(self.shadow_map_framebuffers[i])
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: vk::Extent2D { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE },
+                        })
+                        .clear_values(&shadow_clear);
+
+                    self.device.cmd_begin_render_pass(cmd, &shadow_rp_begin, vk::SubpassContents::INLINE);
+                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.shadow_pipeline);
+                    self.device.cmd_set_viewport(cmd, 0, &[shadow_viewport]);
+                    self.device.cmd_set_scissor(cmd, 0, &[shadow_scissor]);
+                    self.device.cmd_set_depth_bias(cmd, 1.25, 0.0, 1.75);
+
+                    let light_vp = self.shadow_vp_matrices[i];
+                    for (world, prim) in scene.draw_primitives() {
+                        let mvp = (light_vp * world).to_cols_array_2d();
+                        let mvp_bytes = bytemuck::bytes_of(&mvp);
+                        self.device.cmd_push_constants(
+                            cmd, self.shadow_pipeline_layout,
+                            vk::ShaderStageFlags::VERTEX, 0, mvp_bytes,
+                        );
+                        self.device.cmd_bind_vertex_buffers(cmd, 0, &[prim.vertex_buffer.buffer], &[0]);
+                        self.device.cmd_bind_index_buffer(cmd, prim.index_buffer.buffer, 0, vk::IndexType::UINT32);
+                        self.device.cmd_draw_indexed(cmd, prim.index_count, 1, 0, 0, 0);
+                    }
+
+                    self.device.cmd_end_render_pass(cmd);
+                }
+
+                // Transition shadow map: DEPTH_STENCIL_ATTACHMENT → DEPTH_STENCIL_READ_ONLY
+                transition_layout_ex(
+                    &self.device, cmd, self.shadow_map_image,
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::ImageAspectFlags::DEPTH,
+                    MAX_SHADOW_CASTERS as u32,
+                );
+        }
+
+        // ── Main render pass ───────────────────────────────────────────────
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -1228,6 +1405,12 @@ impl Renderer {
         self.device.cmd_bind_descriptor_sets(
             cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
             2, &[self.env_descriptor_sets[frame]], &[],
+        );
+
+        // Bind shadow map descriptor set (set 3)
+        self.device.cmd_bind_descriptor_sets(
+            cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
+            3, &[self.shadow_descriptor_sets[frame]], &[],
         );
 
         // Draw skybox if environment map is loaded
@@ -1322,6 +1505,22 @@ impl Renderer {
         }
 
         self.device.cmd_end_render_pass(cmd);
+
+        // Transition shadow map back to attachment layout for next frame
+        if self.shadow_active_count > 0 && self.gpu_scene.is_some() {
+            transition_layout_ex(
+                &self.device, cmd, self.shadow_map_image,
+                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::AccessFlags::SHADER_READ,
+                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::ImageAspectFlags::DEPTH,
+                MAX_SHADOW_CASTERS as u32,
+            );
+        }
+
         self.device.end_command_buffer(cmd)?;
         Ok(())
     }
@@ -1347,6 +1546,7 @@ impl Renderer {
             let (_layout, pipeline) = create_pipeline(
                 &self.device, self.render_pass,
                 self.descriptor_set_layout, self.material_set_layout, self.env_set_layout,
+                self.shadow_set_layout,
                 self.pipeline_cache, Some(&pair), Some(self.pipeline_layout),
             )?;
 
@@ -1671,6 +1871,23 @@ impl Drop for Renderer {
             self.env_fallback_texture.destroy(&self.device);
             self.device.destroy_descriptor_pool(self.env_descriptor_pool, None);
             self.device.destroy_descriptor_set_layout(self.env_set_layout, None);
+
+            // Shadow mapping cleanup
+            for fb in &self.shadow_map_framebuffers {
+                self.device.destroy_framebuffer(*fb, None);
+            }
+            for view in &self.shadow_map_layer_views {
+                self.device.destroy_image_view(*view, None);
+            }
+            self.device.destroy_image_view(self.shadow_map_view, None);
+            self.device.destroy_image(self.shadow_map_image, None);
+            self.device.free_memory(self.shadow_map_memory, None);
+            self.device.destroy_sampler(self.shadow_map_sampler, None);
+            self.device.destroy_descriptor_pool(self.shadow_descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.shadow_set_layout, None);
+            self.device.destroy_pipeline(self.shadow_pipeline, None);
+            self.device.destroy_pipeline_layout(self.shadow_pipeline_layout, None);
+            self.device.destroy_render_pass(self.shadow_render_pass, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
 
@@ -2187,6 +2404,7 @@ unsafe fn create_pipeline(
     descriptor_set_layout: vk::DescriptorSetLayout,
     material_set_layout: vk::DescriptorSetLayout,
     env_set_layout: vk::DescriptorSetLayout,
+    shadow_set_layout: vk::DescriptorSetLayout,
     pipeline_cache: vk::PipelineCache,
     shader_pair: Option<&ShaderPair>,
     existing_layout: Option<vk::PipelineLayout>,
@@ -2257,7 +2475,7 @@ unsafe fn create_pipeline(
     let layout = if let Some(layout) = existing_layout {
         layout
     } else {
-        let set_layouts = [descriptor_set_layout, material_set_layout, env_set_layout];
+        let set_layouts = [descriptor_set_layout, material_set_layout, env_set_layout, shadow_set_layout];
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -2516,6 +2734,354 @@ pub fn load_spirv(path: &std::path::Path) -> Result<Vec<u32>> {
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect())
+}
+
+// ── Shadow mapping resources ───────────────────────────────────────────────
+
+const SHADOW_MAP_SIZE: u32 = 2048;
+
+struct ShadowResources {
+    render_pass: vk::RenderPass,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    map_image: vk::Image,
+    map_memory: vk::DeviceMemory,
+    map_view: vk::ImageView,
+    layer_views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    sampler: vk::Sampler,
+    set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+}
+
+unsafe fn create_shadow_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+    device
+        .create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding)),
+            None,
+        )
+        .context("shadow descriptor set layout")
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_shadow_resources(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    pipeline_cache: vk::PipelineCache,
+    set_layout: vk::DescriptorSetLayout,
+) -> Result<ShadowResources> {
+    let layer_count = MAX_SHADOW_CASTERS as u32;
+
+    // --- Render pass (depth-only) ---
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(vk::Format::D32_SFLOAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+    let depth_ref = vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .depth_stencil_attachment(&depth_ref);
+
+    let dependency = vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+        .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+        .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+
+    let render_pass = device
+        .create_render_pass(
+            &vk::RenderPassCreateInfo::default()
+                .attachments(std::slice::from_ref(&depth_attachment))
+                .subpasses(std::slice::from_ref(&subpass))
+                .dependencies(std::slice::from_ref(&dependency)),
+            None,
+        )
+        .context("shadow render pass")?;
+
+    // --- Shadow map image (2D array) ---
+    let map_image = device
+        .create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .extent(vk::Extent3D { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE, depth: 1 })
+                .mip_levels(1)
+                .array_layers(layer_count)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )
+        .context("shadow map image")?;
+
+    let mem_req = device.get_image_memory_requirements(map_image);
+    let mem_type_idx = find_mem_type(
+        instance, physical_device, mem_req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    let map_memory = device
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_req.size)
+                .memory_type_index(mem_type_idx),
+            None,
+        )
+        .context("shadow map memory")?;
+    device.bind_image_memory(map_image, map_memory, 0)?;
+
+    // Transition to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    {
+        use crate::buffer::{begin_one_shot, end_one_shot};
+        let cmd = begin_one_shot(device, command_pool)?;
+        transition_layout_ex(
+            device, cmd, map_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::ImageAspectFlags::DEPTH,
+            layer_count,
+        );
+        end_one_shot(device, command_pool, queue, cmd)?;
+    }
+
+    // Array view (for sampling in fragment shader)
+    let map_view = device
+        .create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(map_image)
+                .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                .format(vk::Format::D32_SFLOAT)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count,
+                }),
+            None,
+        )
+        .context("shadow map array view")?;
+
+    // Per-layer views (for framebuffer attachments)
+    let mut layer_views = Vec::with_capacity(layer_count as usize);
+    for i in 0..layer_count {
+        let view = device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(map_image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: i,
+                        layer_count: 1,
+                    }),
+                None,
+            )
+            .context("shadow map layer view")?;
+        layer_views.push(view);
+    }
+
+    // Per-layer framebuffers
+    let mut framebuffers = Vec::with_capacity(layer_count as usize);
+    for &lv in &layer_views {
+        let fb = device
+            .create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(std::slice::from_ref(&lv))
+                    .width(SHADOW_MAP_SIZE)
+                    .height(SHADOW_MAP_SIZE)
+                    .layers(1),
+                None,
+            )
+            .context("shadow framebuffer")?;
+        framebuffers.push(fb);
+    }
+
+    // --- Shadow sampler (no comparison — MoltenVK lacks mutableComparisonSamplers) ---
+    let sampler = device
+        .create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .max_lod(1.0),
+            None,
+        )
+        .context("shadow sampler")?;
+
+    // --- Shadow pipeline (depth-only, vertex shader only) ---
+    let vert_spv = shadow_vert_spv();
+    let vert_module = device
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
+        .context("shadow vert shader module")?;
+
+    let entry_point = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry_point),
+    ];
+
+    let vertex_binding = vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(std::mem::size_of::<Vertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX);
+    let vertex_attrs = [
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 12 },
+        vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 24 },
+        vk::VertexInputAttributeDescription { location: 3, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 32 },
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(std::slice::from_ref(&vertex_binding))
+        .vertex_attribute_descriptions(&vertex_attrs);
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::FRONT) // render back-faces to reduce shadow acne
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .depth_bias_enable(true)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS);
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
+    let dynamic_states = [
+        vk::DynamicState::VIEWPORT,
+        vk::DynamicState::SCISSOR,
+        vk::DynamicState::DEPTH_BIAS,
+    ];
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+        .dynamic_states(&dynamic_states);
+
+    let push_constant_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(64); // mat4 = 64 bytes
+
+    let pipeline_layout = device
+        .create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .push_constant_ranges(std::slice::from_ref(&push_constant_range)),
+            None,
+        )
+        .context("shadow pipeline layout")?;
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0);
+
+    let pipeline = device
+        .create_graphics_pipelines(pipeline_cache, &[pipeline_info], None)
+        .map_err(|(_, e)| e)
+        .context("shadow pipeline")?[0];
+
+    device.destroy_shader_module(vert_module, None);
+
+    // --- Descriptor pool + sets ---
+    let pool_size = vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: FRAMES_IN_FLIGHT as u32,
+    };
+    let descriptor_pool = device
+        .create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(FRAMES_IN_FLIGHT as u32)
+                .pool_sizes(std::slice::from_ref(&pool_size)),
+            None,
+        )
+        .context("shadow descriptor pool")?;
+
+    let layouts = vec![set_layout; FRAMES_IN_FLIGHT];
+    let descriptor_sets = device
+        .allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts),
+        )
+        .context("shadow descriptor sets")?;
+
+    // Write shadow map view + sampler to each frame's descriptor set
+    for &ds in &descriptor_sets {
+        let image_info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: map_view,
+            image_layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(ds)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info);
+        device.update_descriptor_sets(&[write], &[]);
+    }
+
+    Ok(ShadowResources {
+        render_pass,
+        pipeline,
+        pipeline_layout,
+        map_image,
+        map_memory,
+        map_view,
+        layer_views,
+        framebuffers,
+        sampler,
+        set_layout,
+        descriptor_pool,
+        descriptor_sets,
+    })
 }
 
 /// Hardcoded unit cube with per-face normals.
