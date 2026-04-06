@@ -77,6 +77,10 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
 vec2 directionToEquirect(vec3 dir) {
     float phi   = atan(dir.z, dir.x);
     float theta = asin(clamp(dir.y, -1.0, 1.0));
@@ -228,8 +232,11 @@ void main() {
     vec3 rawSpecEnv = texture(envMap, directionToEquirect(R)).rgb;
     // Allow higher values for specular to preserve bright reflections
     vec3 specEnv = min(rawSpecEnv, vec3(20.0));
-    vec3 F_ibl = fresnelSchlick(max(dot(N, V), 0.0), F0);
-    vec3 specularIBL = specEnv * F_ibl;
+    // Use roughness-aware Fresnel: reduces specular reflection for rough surfaces
+    vec3 F_ibl = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);
+    // Without a pre-filtered environment map, attenuate specular by roughness
+    // to approximate the blurring effect of rough surfaces
+    vec3 specularIBL = specEnv * F_ibl * (1.0 - roughness * roughness);
 
     vec3 ambient = (diffuseIBL + specularIBL) * occlusion * frame.envIntensity;
 
