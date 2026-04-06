@@ -10,13 +10,11 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::camera::OrbitalCamera;
-use crate::input::InputState;
-use crate::renderer::Renderer;
-use crate::scene::{gltf_loader, loader, mitsuba_loader, GpuTexture, Scene};
-use crate::shader::ShaderLibrary;
-use crate::types::GpuLight;
-use crate::vulkan::image::{load_hdr_to_rgba32f, GpuImage};
+use lightbender_interaction::{InputState, OrbitalCamera};
+use lightbender_object_loaders::{load_gltf, load_image_hdr};
+use lightbender_renderer::{load_spirv, Renderer};
+use lightbender_scene::Light;
+use lightbender_scene_loaders::{load_json_scene, load_mitsuba, LightDesc};
 
 pub enum InputPath {
     Model(PathBuf),
@@ -32,22 +30,9 @@ pub struct App {
 
 struct AppState {
     window:   Arc<Window>,
-    // scene must be dropped before renderer (GPU resources freed before device)
-    scene:    Option<Scene>,
     renderer: Renderer,
     camera:   OrbitalCamera,
     input:    InputState,
-}
-
-impl Drop for AppState {
-    fn drop(&mut self) {
-        if let Some(scene) = self.scene.take() {
-            unsafe {
-                let _ = self.renderer.device_wait_idle();
-                scene.destroy(self.renderer.device());
-            }
-        }
-    }
 }
 
 impl App {
@@ -64,33 +49,38 @@ impl App {
             )?,
         );
         let mut renderer = Renderer::new(window.clone())?;
-        let (scene, camera) = load_scene_from_input(&mut renderer, self.input_path.as_ref())?;
+        let camera = load_scene_into_renderer(&mut renderer, self.input_path.as_ref())?;
 
         let input = InputState::default();
-        self.state = Some(AppState { window, scene, renderer, camera, input });
+        self.state = Some(AppState { window, renderer, camera, input });
         Ok(())
     }
 }
 
 /// Load a scene/model from the given input path, setting up camera, shaders,
 /// and environment maps on the renderer. Used by both windowed and headless paths.
-pub fn load_scene_from_input(
+pub fn load_scene_into_renderer(
     renderer: &mut Renderer,
     input_path: Option<&InputPath>,
-) -> Result<(Option<Scene>, OrbitalCamera)> {
+) -> Result<OrbitalCamera> {
     let mut camera = OrbitalCamera::new(Vec3::ZERO, 3.5, 30.0, 20.0);
 
-    let scene = match input_path {
+    match input_path {
         Some(InputPath::Model(path)) => {
-            let ctx = renderer.load_context();
-            match gltf_loader::load(&ctx, path) {
-                Ok(s) => { log::info!("Loaded: {}", path.display()); Some(s) }
-                Err(e) => { log::error!("Failed to load model: {e:#}"); None }
+            match load_gltf(path) {
+                Ok(scene) => {
+                    renderer.upload_scene(&scene)?;
+                    log::info!("Loaded: {}", path.display());
+                }
+                Err(e) => log::error!("Failed to load model: {e:#}"),
             }
         }
         Some(InputPath::Scene(path)) => {
-            match loader::load_scene(renderer, path) {
+            match load_json_scene(path) {
                 Ok(loaded) => {
+                    // Upload the scene
+                    renderer.upload_scene(&loaded.scene)?;
+
                     // Apply camera from scene description
                     let cd = &loaded.description.camera;
                     camera = OrbitalCamera::new(
@@ -105,7 +95,6 @@ pub fn load_scene_from_input(
 
                     // Load named shader pipelines from scene description
                     let base = path.parent().unwrap_or(std::path::Path::new("."));
-                    let mut lib = ShaderLibrary::new();
                     for (name, sd) in &loaded.description.shaders {
                         let vert_path = if std::path::Path::new(&sd.vert).is_absolute() {
                             std::path::PathBuf::from(&sd.vert)
@@ -117,20 +106,19 @@ pub fn load_scene_from_input(
                         } else {
                             base.join(&sd.frag)
                         };
-                        match unsafe { lib.load(renderer.device(), name, &vert_path, &frag_path) } {
-                            Ok(()) => {
-                                let pair = lib.pairs.get(name).unwrap();
-                                if let Err(e) = renderer.add_pipeline(name, pair) {
+                        match (load_spirv(&vert_path), load_spirv(&frag_path)) {
+                            (Ok(vert_spv), Ok(frag_spv)) => {
+                                if let Err(e) = renderer.add_pipeline_spirv(name, &vert_spv, &frag_spv) {
                                     log::error!("Failed to build pipeline '{name}': {e:#}");
                                 } else {
                                     log::info!("Registered shader pipeline: {name}");
                                 }
                             }
-                            Err(e) => log::error!("Failed to load shader '{name}': {e:#}"),
+                            (Err(e), _) | (_, Err(e)) => {
+                                log::error!("Failed to load shader '{name}': {e:#}");
+                            }
                         }
                     }
-                    // Shader modules can be destroyed after pipeline creation
-                    unsafe { lib.destroy(renderer.device()); }
 
                     // Load environment map if specified
                     if let Some(map_path) = &loaded.description.environment.map {
@@ -139,70 +127,82 @@ pub fn load_scene_from_input(
                         } else {
                             base.join(map_path)
                         };
-                        match load_and_upload_env_map(renderer, &resolved) {
-                            Ok(tex) => {
+                        match load_image_hdr(&resolved) {
+                            Ok(tex_data) => {
                                 let intensity = loaded.description.environment.map_intensity;
-                                renderer.set_environment_map(tex, intensity)?;
-                                log::info!("Loaded environment map: {} (intensity={})", resolved.display(), intensity);
+                                if let Err(e) = renderer.set_environment_map(&tex_data, intensity) {
+                                    log::error!("Failed to set env map: {e:#}");
+                                } else {
+                                    log::info!("Loaded environment map: {} (intensity={})", resolved.display(), intensity);
+                                }
                             }
                             Err(e) => log::error!("Failed to load environment map: {e:#}"),
                         }
                     }
 
-                    // Convert JSON lights to GPU lights
-                    let gpu_lights: Vec<GpuLight> = loaded.description.lights.iter().map(|l| {
+                    // Convert JSON lights to scene lights
+                    let lights: Vec<Light> = loaded.description.lights.iter().map(|l| {
                         match l {
-                            loader::LightDesc::Directional { direction, color, intensity, .. } => {
-                                GpuLight {
+                            LightDesc::Directional { direction, color, intensity, .. } => {
+                                Light {
                                     position_or_direction: [direction[0], direction[1], direction[2], 0.0],
                                     color: *color,
                                     intensity: *intensity,
-                                    ..Default::default()
+                                    range: 0.0,
+                                    spot_angles: [0.0, 0.0],
                                 }
                             }
-                            loader::LightDesc::Point { position, color, intensity, range, .. } => {
-                                GpuLight {
+                            LightDesc::Point { position, color, intensity, range, .. } => {
+                                Light {
                                     position_or_direction: [position[0], position[1], position[2], 1.0],
                                     color: *color,
                                     intensity: *intensity,
                                     range: *range,
-                                    ..Default::default()
+                                    spot_angles: [0.0, 0.0],
                                 }
                             }
-                            loader::LightDesc::Spot { position, color, intensity, range, inner_cone_angle, outer_cone_angle, .. } => {
-                                GpuLight {
+                            LightDesc::Spot { position, color, intensity, range, inner_cone_angle, outer_cone_angle, .. } => {
+                                Light {
                                     position_or_direction: [position[0], position[1], position[2], 2.0],
                                     color: *color,
                                     intensity: *intensity,
                                     range: *range,
                                     spot_angles: [inner_cone_angle.to_radians().cos(), outer_cone_angle.to_radians().cos()],
-                                    ..Default::default()
                                 }
                             }
                         }
                     }).collect();
-                    if !gpu_lights.is_empty() {
-                        log::info!("Setting {} scene lights", gpu_lights.len());
-                        renderer.set_lights(gpu_lights);
+                    if !lights.is_empty() {
+                        log::info!("Setting {} scene lights", lights.len());
+                        renderer.set_lights(lights);
                     }
 
                     log::info!("Loaded scene: {}", path.display());
-                    Some(loaded.scene)
                 }
-                Err(e) => { log::error!("Failed to load scene: {e:#}"); None }
+                Err(e) => log::error!("Failed to load scene: {e:#}"),
             }
         }
         Some(InputPath::MitsubaScene(path)) => {
-            match mitsuba_loader::load_mitsuba(renderer, path) {
+            match load_mitsuba(path) {
                 Ok(loaded) => {
-                    camera = loaded.camera;
+                    // Upload the scene
+                    renderer.upload_scene(&loaded.scene)?;
+
+                    // Apply camera
+                    let cp = &loaded.camera;
+                    camera = OrbitalCamera::new(
+                        cp.target, cp.distance, cp.yaw_deg, cp.pitch_deg,
+                    );
+                    camera.camera.fov_y = cp.fov_y;
+                    camera.camera.near  = cp.near;
+                    camera.camera.far   = cp.far;
 
                     // Load environment map if present
                     if let Some(ref map_path) = loaded.env_map {
                         let resolved = std::path::PathBuf::from(map_path);
-                        match load_and_upload_env_map(renderer, &resolved) {
-                            Ok(tex) => {
-                                if let Err(e) = renderer.set_environment_map(tex, loaded.env_scale) {
+                        match load_image_hdr(&resolved) {
+                            Ok(tex_data) => {
+                                if let Err(e) = renderer.set_environment_map(&tex_data, loaded.env_scale) {
                                     log::error!("Failed to set env map: {e:#}");
                                 } else {
                                     log::info!("Loaded environment map: {} (intensity={})", resolved.display(), loaded.env_scale);
@@ -219,15 +219,14 @@ pub fn load_scene_from_input(
                     }
 
                     log::info!("Loaded Mitsuba scene: {}", path.display());
-                    Some(loaded.scene)
                 }
-                Err(e) => { log::error!("Failed to load Mitsuba scene: {e:#}"); None }
+                Err(e) => log::error!("Failed to load Mitsuba scene: {e:#}"),
             }
         }
-        None => None,
-    };
+        None => {}
+    }
 
-    Ok((scene, camera))
+    Ok(camera)
 }
 
 impl ApplicationHandler for App {
@@ -303,7 +302,7 @@ impl ApplicationHandler for App {
                 state.camera.update(&state.input);
                 state.input.flush();
 
-                match state.renderer.draw_frame(&state.camera.camera, state.scene.as_ref()) {
+                match state.renderer.draw_frame(&state.camera.camera) {
                     Ok(_) => {}
                     Err(e) => {
                         log::error!("draw_frame failed: {e:#}");
@@ -332,37 +331,4 @@ impl ApplicationHandler for App {
             state.window.request_redraw();
         }
     }
-}
-
-fn load_and_upload_env_map(
-    renderer: &Renderer,
-    path: &std::path::Path,
-) -> anyhow::Result<GpuTexture> {
-    use anyhow::Context;
-    use ash::vk;
-
-    let (width, height, pixels) = load_hdr_to_rgba32f(path)?;
-    let ctx = renderer.load_context();
-
-    let image = unsafe {
-        GpuImage::upload_rgba32f(
-            ctx.device, ctx.instance, ctx.physical_device,
-            ctx.command_pool, ctx.queue,
-            width, height, &pixels,
-        ).context("upload environment map")?
-    };
-
-    let sampler = unsafe {
-        ctx.device.create_sampler(
-            &vk::SamplerCreateInfo::default()
-                .mag_filter(vk::Filter::LINEAR)
-                .min_filter(vk::Filter::LINEAR)
-                .address_mode_u(vk::SamplerAddressMode::REPEAT)
-                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-            None,
-        ).context("create env map sampler")?
-    };
-
-    Ok(GpuTexture { image, sampler })
 }
