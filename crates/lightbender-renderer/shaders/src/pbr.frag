@@ -119,14 +119,15 @@ void main() {
     float occlusion         = texture(texOcclusion, fragUV).r;
     vec3 emissive           = texture(texEmissive, fragUV).rgb;
 
-    // Apply material factors
+    // Apply material factors (both texture samples and factors are in linear space;
+    // sRGB→linear conversion is handled by the VK_FORMAT_R8G8B8A8_SRGB texture format)
     baseColorSample *= material.baseColorFactor;
     emissive = emissive * material.emissiveFactor;
 
     // Alpha cutout
     if (baseColorSample.a < 0.01) discard;
 
-    vec3 albedo    = pow(baseColorSample.rgb, vec3(2.2)); // sRGB → linear
+    vec3 albedo    = baseColorSample.rgb;
     float metallic  = metallicRoughness.x * material.metallicFactor;
     float roughness = max(metallicRoughness.y * material.roughnessFactor, 0.04);
 
@@ -148,9 +149,9 @@ void main() {
     float NdotV = max(dot(N, V), 0.001);
     vec3 Lo = vec3(0.0);
 
-    // Fallback: if no lights are defined, use a default sun
+    // Fallback: if no lights are defined and no environment map, use a default sun
     uint numLights = frame.lightCount;
-    if (numLights == 0u) {
+    if (numLights == 0u && frame.envIntensity == 0.0) {
         // Default directional light (warm sunlight)
         vec3 L = normalize(vec3(1.0, 2.0, 1.5));
         vec3 H = normalize(V + L);
@@ -215,11 +216,18 @@ void main() {
     }
 
     // Image-based lighting (IBL) from environment map
-    vec3 irradiance = texture(envMap, directionToEquirect(N)).rgb;
-    vec3 diffuseIBL = irradiance * albedo * (1.0 - metallic);
+    // Clamp samples to prevent extreme HDR values from causing overexposure.
+    // Without a pre-convolved irradiance map, point-sampling raw HDR radiance
+    // can return extreme values (e.g. sun disc); clamping approximates the
+    // hemisphere-averaging effect of a proper irradiance map.
+    vec3 rawIrradiance = texture(envMap, directionToEquirect(N)).rgb;
+    vec3 irradiance = min(rawIrradiance, vec3(3.0));
+    vec3 diffuseIBL = irradiance * (albedo / PI) * (1.0 - metallic);
 
     vec3 R = reflect(-V, N);
-    vec3 specEnv = texture(envMap, directionToEquirect(R)).rgb;
+    vec3 rawSpecEnv = texture(envMap, directionToEquirect(R)).rgb;
+    // Allow higher values for specular to preserve bright reflections
+    vec3 specEnv = min(rawSpecEnv, vec3(20.0));
     vec3 F_ibl = fresnelSchlick(max(dot(N, V), 0.0), F0);
     vec3 specularIBL = specEnv * F_ibl;
 

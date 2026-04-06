@@ -96,11 +96,8 @@ impl GpuScene {
         }
 
         // ── Placeholder textures ────────────────────────────────────────────
-        let make_placeholder = |pixels: [u8; 4]| -> Result<GpuTexture> {
-            let img = GpuImage::upload_rgba8(
-                device, instance, physical_device, command_pool, queue, 1, 1, &pixels,
-            )?;
-            let sampler = device.create_sampler(
+        let make_sampler = || -> Result<vk::Sampler> {
+            Ok(device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::NEAREST)
                     .min_filter(vk::Filter::NEAREST)
@@ -108,13 +105,25 @@ impl GpuScene {
                     .address_mode_v(vk::SamplerAddressMode::REPEAT)
                     .address_mode_w(vk::SamplerAddressMode::REPEAT),
                 None,
-            )?;
-            Ok(GpuTexture { image: img, sampler })
+            )?)
         };
-        let white_tex       = make_placeholder([255, 255, 255, 255])?;
-        let flat_normal_tex = make_placeholder([128, 128, 255, 255])?;
-        let mr_placeholder  = make_placeholder([0, 128, 0, 255])?;
-        let black_tex       = make_placeholder([0, 0, 0, 255])?;
+        let make_srgb_placeholder = |pixels: [u8; 4]| -> Result<GpuTexture> {
+            let img = GpuImage::upload_rgba8(
+                device, instance, physical_device, command_pool, queue, 1, 1, &pixels,
+            )?;
+            Ok(GpuTexture { image: img, sampler: make_sampler()? })
+        };
+        let make_linear_placeholder = |pixels: [u8; 4]| -> Result<GpuTexture> {
+            let img = GpuImage::upload_rgba8_unorm(
+                device, instance, physical_device, command_pool, queue, 1, 1, &pixels,
+            )?;
+            Ok(GpuTexture { image: img, sampler: make_sampler()? })
+        };
+        // Base color and emissive are sRGB; normal, metallic-roughness, occlusion are linear
+        let white_tex       = make_srgb_placeholder([255, 255, 255, 255])?;
+        let flat_normal_tex = make_linear_placeholder([128, 128, 255, 255])?;
+        let mr_placeholder  = make_linear_placeholder([0, 128, 0, 255])?;
+        let black_tex       = make_srgb_placeholder([0, 0, 0, 255])?;
 
         // ── Descriptor pool for materials ───────────────────────────────────
         let mat_count = scene.materials.len().max(1) as u32;

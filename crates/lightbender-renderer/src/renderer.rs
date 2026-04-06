@@ -1351,6 +1351,20 @@ impl Renderer {
                     vk::ImageAspectFlags::DEPTH,
                     MAX_SHADOW_CASTERS as u32,
                 );
+        } else {
+            // No shadow pass was executed, but the shadow map descriptor still
+            // expects READ_ONLY_OPTIMAL layout for sampling in the main pass.
+            transition_layout_ex(
+                &self.device, cmd, self.shadow_map_image,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::SHADER_READ,
+                vk::ImageAspectFlags::DEPTH,
+                MAX_SHADOW_CASTERS as u32,
+            );
         }
 
         // ── Main render pass ───────────────────────────────────────────────
@@ -1507,19 +1521,17 @@ impl Renderer {
         self.device.cmd_end_render_pass(cmd);
 
         // Transition shadow map back to attachment layout for next frame
-        if self.shadow_active_count > 0 && self.gpu_scene.is_some() {
-            transition_layout_ex(
-                &self.device, cmd, self.shadow_map_image,
-                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-                vk::AccessFlags::SHADER_READ,
-                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::ImageAspectFlags::DEPTH,
-                MAX_SHADOW_CASTERS as u32,
-            );
-        }
+        transition_layout_ex(
+            &self.device, cmd, self.shadow_map_image,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::ImageAspectFlags::DEPTH,
+            MAX_SHADOW_CASTERS as u32,
+        );
 
         self.device.end_command_buffer(cmd)?;
         Ok(())

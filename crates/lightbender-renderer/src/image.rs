@@ -31,6 +31,26 @@ impl GpuImage {
         )
     }
 
+    /// Upload RGBA8 pixel data as linear (non-sRGB) to a DEVICE_LOCAL 2D image.
+    /// Use for non-color data: normal maps, metallic-roughness, occlusion, etc.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn upload_rgba8_unorm(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<Self> {
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+        Self::upload_image(
+            device, instance, physical_device, command_pool, queue,
+            width, height, pixels, vk::Format::R8G8B8A8_UNORM,
+        )
+    }
+
     /// Upload RGBA float32 pixel data to a DEVICE_LOCAL 2D image (R32G32B32A32_SFLOAT).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn upload_rgba32f(
