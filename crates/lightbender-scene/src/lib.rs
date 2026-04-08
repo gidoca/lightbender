@@ -34,7 +34,10 @@ pub struct GpuLight {
     /// Index into FrameUniforms::shadow_vp (-1 = no shadow).
     pub shadow_vp_index: i32,            // offset 48
     pub shadow_bias:     f32,            // offset 52
-    pub _pad1:           [f32; 2],       // offset 56  (pad to 64)
+    /// World→UV scale of the light footprint at the shadow map's near plane,
+    /// used by PCSS to drive penumbra width. Set to 0 to disable PCSS for this light.
+    pub light_size_uv:   f32,            // offset 56
+    pub _pad1:           f32,            // offset 60  (pad to 64)
 }
 
 impl Default for GpuLight {
@@ -48,20 +51,50 @@ impl Default for GpuLight {
 
 pub const MAX_LIGHTS: usize = 8;
 pub const MAX_SHADOW_CASTERS: usize = 4;
+pub const MAX_AREA_LIGHTS: usize = 4;
+
+/// A rectangular area light, packed for the UBO.
+/// std140 layout: 5×vec4 + vec4 = 96 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct GpuAreaLight {
+    /// Four world-space corners (xyz; w unused). Counter-clockwise when
+    /// viewed from the lit side, so the rectangle normal is
+    /// `normalize(cross(p1-p0, p3-p0))`.
+    pub p0: [f32; 4],         // offset  0
+    pub p1: [f32; 4],         // offset 16
+    pub p2: [f32; 4],         // offset 32
+    pub p3: [f32; 4],         // offset 48
+    pub color:           [f32; 3], // offset 64
+    pub intensity:       f32,      // offset 76
+    pub shadow_vp_index: i32,      // offset 80 (-1 = no shadow)
+    pub light_size_uv:   f32,      // offset 84 (PCSS kernel scale)
+    pub _pad:            [f32; 2], // offset 88 (pad to 96)
+}
+
+impl Default for GpuAreaLight {
+    fn default() -> Self {
+        Self {
+            shadow_vp_index: -1,
+            ..bytemuck::Zeroable::zeroed()
+        }
+    }
+}
 
 /// Per-frame uniform buffer (set 0, binding 0).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct FrameUniforms {
-    pub view:            [[f32; 4]; 4],
-    pub projection:      [[f32; 4]; 4],
-    pub camera_position: [f32; 4], // w unused
-    pub lights:          [GpuLight; MAX_LIGHTS],
-    pub light_count:     u32,
-    pub env_intensity:   f32,
-    pub shadow_count:    u32,
-    pub _pad:            u32,
-    pub shadow_vp:       [[[f32; 4]; 4]; MAX_SHADOW_CASTERS],
+    pub view:             [[f32; 4]; 4],
+    pub projection:       [[f32; 4]; 4],
+    pub camera_position:  [f32; 4], // w unused
+    pub lights:           [GpuLight; MAX_LIGHTS],
+    pub light_count:      u32,
+    pub env_intensity:    f32,
+    pub shadow_count:     u32,
+    pub area_light_count: u32,
+    pub shadow_vp:        [[[f32; 4]; 4]; MAX_SHADOW_CASTERS],
+    pub area_lights:      [GpuAreaLight; MAX_AREA_LIGHTS],
 }
 
 /// Material factors pushed alongside the model matrix (push constants).
@@ -232,7 +265,8 @@ impl Light {
             spot_angles: self.spot_angles,
             shadow_vp_index: -1,
             shadow_bias:     0.005,
-            _pad1:           [0.0; 2],
+            light_size_uv:   0.0,
+            _pad1:           0.0,
         }
     }
 }

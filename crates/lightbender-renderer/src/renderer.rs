@@ -10,8 +10,8 @@ use winit::window::Window;
 
 use lightbender_interaction::Camera;
 use lightbender_scene::{
-    FrameUniforms, GpuLight, Light, MaterialPushConstants, Scene, TextureData, TextureFormat,
-    Vertex, MAX_LIGHTS, MAX_SHADOW_CASTERS,
+    FrameUniforms, GpuAreaLight, GpuLight, Light, MaterialPushConstants, Scene, TextureData,
+    TextureFormat, Vertex, MAX_AREA_LIGHTS, MAX_LIGHTS, MAX_SHADOW_CASTERS,
 };
 
 use crate::buffer::{find_memory_type as find_mem_type, upload_to_device_local, GpuBuffer};
@@ -1270,8 +1270,9 @@ impl Renderer {
             light_count: count as u32,
             env_intensity: self.env_intensity,
             shadow_count,
-            _pad: 0,
+            area_light_count: 0,
             shadow_vp,
+            area_lights: [GpuAreaLight::default(); MAX_AREA_LIGHTS],
         };
         self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))?;
         Ok((shadow_vp_mats, shadow_count))
