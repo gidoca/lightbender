@@ -217,6 +217,10 @@ pub fn load_scene_into_renderer(
                         log::info!("Setting {} scene lights", loaded.lights.len());
                         renderer.set_lights(loaded.lights);
                     }
+                    if !loaded.area_lights.is_empty() {
+                        log::info!("Setting {} area lights", loaded.area_lights.len());
+                        renderer.set_area_lights(loaded.area_lights);
+                    }
 
                     log::info!("Loaded Mitsuba scene: {}", path.display());
                 }

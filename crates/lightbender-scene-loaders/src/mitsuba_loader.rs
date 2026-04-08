@@ -7,8 +7,8 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use lightbender_scene::{
-    Light, Material, Mesh, Primitive, SamplerDesc, Scene, SceneNode, TextureData, TextureFormat,
-    Transform, Vertex,
+    AreaLight, Light, Material, Mesh, Primitive, SamplerDesc, Scene, SceneNode, TextureData,
+    TextureFormat, Transform, Vertex,
 };
 
 /// Camera parameters extracted from a Mitsuba scene (plain data, not a camera controller).
@@ -23,11 +23,12 @@ pub struct CameraParams {
 }
 
 pub struct LoadedMitsubaScene {
-    pub scene:     Scene,
-    pub camera:    CameraParams,
-    pub lights:    Vec<Light>,
-    pub env_map:   Option<String>,
-    pub env_scale: f32,
+    pub scene:       Scene,
+    pub camera:      CameraParams,
+    pub lights:      Vec<Light>,
+    pub area_lights: Vec<AreaLight>,
+    pub env_map:     Option<String>,
+    pub env_scale:   f32,
 }
 
 pub fn load_mitsuba(path: &Path) -> Result<LoadedMitsubaScene> {
@@ -108,6 +109,7 @@ pub fn load_mitsuba(path: &Path) -> Result<LoadedMitsubaScene> {
     let mut meshes: Vec<Mesh> = Vec::new();
     let mut nodes: Vec<SceneNode> = Vec::new();
     let mut lights: Vec<Light> = Vec::new();
+    let mut area_lights: Vec<AreaLight> = Vec::new();
 
     for (i, shape) in shapes.iter().enumerate() {
         if shape.vertices.is_empty() || shape.indices.is_empty() {
@@ -188,17 +190,22 @@ pub fn load_mitsuba(path: &Path) -> Result<LoadedMitsubaScene> {
             mesh: Some(mesh_idx),
         });
 
-        // Area emitter -> point light proxy at centroid
+        // Area emitter -> first-class AreaLight (rectangle corners in world space).
+        // Mitsuba's `rectangle` shape spans [-1,-1,0]..[1,1,0] before to_world,
+        // and is the only area-emitter geometry the loader currently produces.
         if let Some(MitsubaEmitter::Area { radiance }) = &shape.area_emitter {
-            let centroid = shape.to_world.transform_point3(Vec3::ZERO);
             let max_r = radiance.x.max(radiance.y).max(radiance.z);
             if max_r > 0.0 {
-                lights.push(Light {
-                    position_or_direction: [centroid.x, centroid.y, centroid.z, 1.0],
+                let corners = [
+                    shape.to_world.transform_point3(Vec3::new(-1.0, -1.0, 0.0)),
+                    shape.to_world.transform_point3(Vec3::new( 1.0, -1.0, 0.0)),
+                    shape.to_world.transform_point3(Vec3::new( 1.0,  1.0, 0.0)),
+                    shape.to_world.transform_point3(Vec3::new(-1.0,  1.0, 0.0)),
+                ];
+                area_lights.push(AreaLight {
+                    corners,
                     color: [radiance.x / max_r, radiance.y / max_r, radiance.z / max_r],
                     intensity: max_r,
-                    range: 100.0,
-                    spot_angles: [0.0, 0.0],
                 });
             }
         }
@@ -244,7 +251,7 @@ pub fn load_mitsuba(path: &Path) -> Result<LoadedMitsubaScene> {
     };
     scene.update_world_transforms();
 
-    Ok(LoadedMitsubaScene { scene, camera, lights, env_map, env_scale })
+    Ok(LoadedMitsubaScene { scene, camera, lights, area_lights, env_map, env_scale })
 }
 
 // ── Texture loading (CPU-only) ──────────────────────────────────────────────
