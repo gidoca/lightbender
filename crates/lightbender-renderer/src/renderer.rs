@@ -17,6 +17,7 @@ use lightbender_scene::{
 use crate::buffer::{find_memory_type as find_mem_type, upload_to_device_local, GpuBuffer};
 use crate::gpu_scene::{GpuScene, GpuTexture};
 use crate::image::{transition_layout_ex, GpuImage};
+use crate::ltc::LtcResources;
 
 // ── Embedded built-in shaders (compiled at build time) ─────────────────────
 
@@ -112,6 +113,8 @@ pub struct Renderer {
     material_set_layout: vk::DescriptorSetLayout,
     /// Set 2: environment map (1× combined image sampler)
     env_set_layout: vk::DescriptorSetLayout,
+    /// Set 4: LTC lookup tables (2× combined image samplers, static).
+    ltc: LtcResources,
     pipeline_layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
     /// "default" pipeline + any user-loaded named pipelines
@@ -361,6 +364,11 @@ impl Renderer {
         let env_set_layout = create_env_set_layout(&device)?;
         let shadow_set_layout = create_shadow_set_layout(&device)?;
 
+        // --- LTC LUTs (set 4) ---
+        let ltc = LtcResources::create(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+        ).context("ltc resources")?;
+
         // --- Pipeline cache ---
         let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
         let pipeline_cache = device.create_pipeline_cache(
@@ -375,8 +383,11 @@ impl Renderer {
 
         // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, shadow_set_layout, pipeline_cache, None, None)
-                .context("pipeline")?;
+            create_pipeline(
+                &device, render_pass, descriptor_set_layout, material_set_layout,
+                env_set_layout, shadow_set_layout, ltc.set_layout,
+                pipeline_cache, None, None,
+            ).context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
         let (double_sided, transparent) = create_pipeline_variants(
@@ -585,6 +596,7 @@ impl Renderer {
             descriptor_set_layout,
             material_set_layout,
             env_set_layout,
+            ltc,
             pipeline_layout,
             pipeline_cache,
             pipelines,
@@ -819,6 +831,10 @@ impl Renderer {
         let env_set_layout = create_env_set_layout(&device)?;
         let shadow_set_layout = create_shadow_set_layout(&device)?;
 
+        let ltc = LtcResources::create(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+        ).context("ltc resources")?;
+
         let cache_data = std::fs::read(PIPELINE_CACHE_FILE).unwrap_or_default();
         let pipeline_cache = device.create_pipeline_cache(
             &vk::PipelineCacheCreateInfo::default().initial_data(&cache_data),
@@ -826,8 +842,11 @@ impl Renderer {
         ).context("pipeline cache")?;
 
         let (pipeline_layout, default_pipeline) =
-            create_pipeline(&device, render_pass, descriptor_set_layout, material_set_layout, env_set_layout, shadow_set_layout, pipeline_cache, None, None)
-                .context("pipeline")?;
+            create_pipeline(
+                &device, render_pass, descriptor_set_layout, material_set_layout,
+                env_set_layout, shadow_set_layout, ltc.set_layout,
+                pipeline_cache, None, None,
+            ).context("pipeline")?;
         let mut pipelines = HashMap::new();
         pipelines.insert("default".to_string(), default_pipeline);
         let (double_sided, transparent) = create_pipeline_variants(
@@ -1005,6 +1024,7 @@ impl Renderer {
             descriptor_set_layout,
             material_set_layout,
             env_set_layout,
+            ltc,
             pipeline_layout,
             pipeline_cache,
             pipelines,
@@ -1416,6 +1436,12 @@ impl Renderer {
             0, &[self.descriptor_sets[frame]], &[],
         );
 
+        // Bind LTC LUT descriptor set (set 4) — static, identical every frame.
+        self.device.cmd_bind_descriptor_sets(
+            cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
+            4, &[self.ltc.descriptor_set], &[],
+        );
+
         // Bind environment map descriptor set (set 2)
         self.device.cmd_bind_descriptor_sets(
             cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
@@ -1559,7 +1585,7 @@ impl Renderer {
             let (_layout, pipeline) = create_pipeline(
                 &self.device, self.render_pass,
                 self.descriptor_set_layout, self.material_set_layout, self.env_set_layout,
-                self.shadow_set_layout,
+                self.shadow_set_layout, self.ltc.set_layout,
                 self.pipeline_cache, Some(&pair), Some(self.pipeline_layout),
             )?;
 
@@ -1884,6 +1910,8 @@ impl Drop for Renderer {
             self.env_fallback_texture.destroy(&self.device);
             self.device.destroy_descriptor_pool(self.env_descriptor_pool, None);
             self.device.destroy_descriptor_set_layout(self.env_set_layout, None);
+
+            self.ltc.destroy(&self.device);
 
             // Shadow mapping cleanup
             for fb in &self.shadow_map_framebuffers {
@@ -2418,6 +2446,7 @@ unsafe fn create_pipeline(
     material_set_layout: vk::DescriptorSetLayout,
     env_set_layout: vk::DescriptorSetLayout,
     shadow_set_layout: vk::DescriptorSetLayout,
+    ltc_set_layout: vk::DescriptorSetLayout,
     pipeline_cache: vk::PipelineCache,
     shader_pair: Option<&ShaderPair>,
     existing_layout: Option<vk::PipelineLayout>,
@@ -2488,7 +2517,13 @@ unsafe fn create_pipeline(
     let layout = if let Some(layout) = existing_layout {
         layout
     } else {
-        let set_layouts = [descriptor_set_layout, material_set_layout, env_set_layout, shadow_set_layout];
+        let set_layouts = [
+            descriptor_set_layout,
+            material_set_layout,
+            env_set_layout,
+            shadow_set_layout,
+            ltc_set_layout,
+        ];
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
