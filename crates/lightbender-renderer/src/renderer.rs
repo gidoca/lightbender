@@ -10,8 +10,8 @@ use winit::window::Window;
 
 use lightbender_interaction::Camera;
 use lightbender_scene::{
-    FrameUniforms, GpuAreaLight, GpuLight, Light, MaterialPushConstants, Scene, TextureData,
-    TextureFormat, Vertex, MAX_AREA_LIGHTS, MAX_LIGHTS, MAX_SHADOW_CASTERS,
+    AreaLight, FrameUniforms, GpuAreaLight, GpuLight, Light, MaterialPushConstants, Scene,
+    TextureData, TextureFormat, Vertex, MAX_AREA_LIGHTS, MAX_LIGHTS, MAX_SHADOW_CASTERS,
 };
 
 use crate::buffer::{find_memory_type as find_mem_type, upload_to_device_local, GpuBuffer};
@@ -133,6 +133,7 @@ pub struct Renderer {
 
     // Scene lights
     lights: Vec<GpuLight>,
+    area_lights: Vec<GpuAreaLight>,
 
     // Environment map
     env_intensity: f32,
@@ -608,6 +609,7 @@ impl Renderer {
             descriptor_pool,
             descriptor_sets,
             lights: Vec::new(),
+            area_lights: Vec::new(),
             env_intensity: 1.0,
             env_texture: None,
             env_fallback_texture,
@@ -1036,6 +1038,7 @@ impl Renderer {
             descriptor_pool,
             descriptor_sets,
             lights: Vec::new(),
+            area_lights: Vec::new(),
             env_intensity: 1.0,
             env_texture: None,
             env_fallback_texture,
@@ -1238,6 +1241,12 @@ impl Renderer {
             lights_arr[i] = *light;
         }
 
+        let mut area_lights_arr = [GpuAreaLight::default(); MAX_AREA_LIGHTS];
+        let area_count = self.area_lights.len().min(MAX_AREA_LIGHTS);
+        for (i, al) in self.area_lights.iter().take(area_count).enumerate() {
+            area_lights_arr[i] = *al;
+        }
+
         // Compute shadow VP matrices for shadow-casting lights
         let mut shadow_vp_mats = [glam::Mat4::IDENTITY; MAX_SHADOW_CASTERS];
         let mut shadow_count = 0u32;
@@ -1257,6 +1266,10 @@ impl Renderer {
                 let light_proj = glam::Mat4::orthographic_rh(-20.0, 20.0, -20.0, 20.0, 0.1, 100.0);
                 shadow_vp_mats[shadow_count as usize] = light_proj * light_view;
                 light.shadow_vp_index = shadow_count as i32;
+                // Hardcoded sun-disc analogue: small but non-zero so PCSS still
+                // produces a tiny penumbra. The orthographic frustum is 40
+                // units across, so this is ~1% of the frustum.
+                light.light_size_uv = 0.01;
                 shadow_count += 1;
             } else if light_type > 1.5 {
                 // Spot light: perspective projection using outer cone angle
@@ -1272,9 +1285,58 @@ impl Renderer {
                 let light_proj = glam::Mat4::perspective_rh(fov, 1.0, 0.1, light.range.max(1.0));
                 shadow_vp_mats[shadow_count as usize] = light_proj * light_view;
                 light.shadow_vp_index = shadow_count as i32;
+                // Tight spot lights have effectively zero source area; PCSS
+                // collapses to a few-tap PCF for these.
+                light.light_size_uv = 0.005;
                 shadow_count += 1;
             }
             // Point lights (w=1) skip shadow mapping (would need cubemap)
+        }
+
+        // Allocate shadow VPs for area lights — perspective frustum looking
+        // from the rectangle centroid along the rectangle normal.
+        for area in area_lights_arr.iter_mut().take(area_count) {
+            if shadow_count as usize >= MAX_SHADOW_CASTERS {
+                break;
+            }
+            let p0 = glam::Vec3::from_slice(&area.p0[..3]);
+            let p1 = glam::Vec3::from_slice(&area.p1[..3]);
+            let p2 = glam::Vec3::from_slice(&area.p2[..3]);
+            let p3 = glam::Vec3::from_slice(&area.p3[..3]);
+
+            let edge_u = p1 - p0;
+            let edge_v = p3 - p0;
+            let normal = edge_u.cross(edge_v).normalize_or_zero();
+            if normal.length_squared() < 0.5 {
+                continue; // degenerate rectangle
+            }
+            let centroid = (p0 + p1 + p2 + p3) * 0.25;
+
+            // Pick a stable up vector. The rectangle's local "v" axis is a
+            // natural choice and avoids gimbal lock when the normal is +/- Y.
+            let up = edge_v.normalize_or_zero();
+            let up = if up.length_squared() < 0.5 { glam::Vec3::Y } else { up };
+            let light_view = glam::Mat4::look_at_rh(centroid, centroid + normal, up);
+            // Wide frustum so the entire visible hemisphere is captured by a
+            // single shadow map. 120° is a good compromise — narrower would
+            // miss grazing angles, wider wastes resolution.
+            let fov = 120.0_f32.to_radians();
+            let near = 0.1_f32;
+            let far = 100.0_f32;
+            let light_proj = glam::Mat4::perspective_rh(fov, 1.0, near, far);
+
+            // PCSS kernel scale: half of the longest edge, projected through
+            // the perspective frustum at the near plane. The shadow map's UV
+            // span at the near plane equals 2 * near * tan(fov/2), so the
+            // light's world half-extent maps to half_extent / span in UVs.
+            let half_extent = edge_u.length().max(edge_v.length()) * 0.5;
+            let frustum_half_at_near = near * (fov * 0.5).tan();
+            let light_size_uv = (half_extent / (2.0 * frustum_half_at_near)).clamp(0.0, 0.25);
+
+            shadow_vp_mats[shadow_count as usize] = light_proj * light_view;
+            area.shadow_vp_index = shadow_count as i32;
+            area.light_size_uv = light_size_uv;
+            shadow_count += 1;
         }
 
         let mut shadow_vp = [[[0.0f32; 4]; 4]; MAX_SHADOW_CASTERS];
@@ -1290,9 +1352,9 @@ impl Renderer {
             light_count: count as u32,
             env_intensity: self.env_intensity,
             shadow_count,
-            area_light_count: 0,
+            area_light_count: area_count as u32,
             shadow_vp,
-            area_lights: [GpuAreaLight::default(); MAX_AREA_LIGHTS],
+            area_lights: area_lights_arr,
         };
         self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))?;
         Ok((shadow_vp_mats, shadow_count))
@@ -1603,6 +1665,10 @@ impl Renderer {
 
     pub fn set_lights(&mut self, lights: Vec<Light>) {
         self.lights = lights.iter().map(|l| l.to_gpu()).collect();
+    }
+
+    pub fn set_area_lights(&mut self, area_lights: Vec<AreaLight>) {
+        self.area_lights = area_lights.iter().map(|a| a.to_gpu()).collect();
     }
 
     /// Set the environment map from CPU-side texture data.
