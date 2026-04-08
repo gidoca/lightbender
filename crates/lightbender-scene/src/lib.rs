@@ -253,6 +253,36 @@ pub struct Light {
     pub spot_angles: [f32; 2],
 }
 
+/// CPU-side description of a rectangular area light.
+///
+/// Corners are listed counter-clockwise as seen from the lit side, so the
+/// rectangle's normal is `normalize(cross(corners[1]-corners[0], corners[3]-corners[0]))`.
+#[derive(Clone, Debug)]
+pub struct AreaLight {
+    pub corners:   [Vec3; 4],
+    pub color:     [f32; 3],
+    pub intensity: f32,
+}
+
+impl AreaLight {
+    /// Convert to the GPU-packed representation. The shadow VP index is
+    /// initialised to -1; the renderer assigns slots during UBO upload.
+    pub fn to_gpu(&self) -> GpuAreaLight {
+        let pad = |v: Vec3| [v.x, v.y, v.z, 0.0];
+        GpuAreaLight {
+            p0: pad(self.corners[0]),
+            p1: pad(self.corners[1]),
+            p2: pad(self.corners[2]),
+            p3: pad(self.corners[3]),
+            color: self.color,
+            intensity: self.intensity,
+            shadow_vp_index: -1,
+            light_size_uv: 0.0,
+            _pad: [0.0; 2],
+        }
+    }
+}
+
 impl Light {
     /// Convert to the GPU-packed representation.
     pub fn to_gpu(&self) -> GpuLight {
