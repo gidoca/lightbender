@@ -473,8 +473,8 @@ impl SsaoResources {
             power: 1.5,
             _pad: 0.0,
             noise_scale: [
-                full_extent.width as f32 / NOISE_SIZE as f32,
-                full_extent.height as f32 / NOISE_SIZE as f32,
+                ao_extent.width as f32 / NOISE_SIZE as f32,
+                ao_extent.height as f32 / NOISE_SIZE as f32,
             ],
             _pad2: [0.0; 2],
         };
@@ -789,6 +789,10 @@ impl SsaoResources {
         full_extent: vk::Extent2D,
     ) -> Result<()> {
         let kernel = generate_kernel();
+        let ao_extent = vk::Extent2D {
+            width: (full_extent.width / 2).max(1),
+            height: (full_extent.height / 2).max(1),
+        };
         let ubo = SsaoUbo {
             samples: kernel,
             projection: projection.to_cols_array_2d(),
@@ -798,8 +802,8 @@ impl SsaoResources {
             power: 1.5,
             _pad: 0.0,
             noise_scale: [
-                full_extent.width as f32 / NOISE_SIZE as f32,
-                full_extent.height as f32 / NOISE_SIZE as f32,
+                ao_extent.width as f32 / NOISE_SIZE as f32,
+                ao_extent.height as f32 / NOISE_SIZE as f32,
             ],
             _pad2: [0.0; 2],
         };

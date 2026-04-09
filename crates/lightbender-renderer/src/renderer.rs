@@ -1406,6 +1406,7 @@ impl Renderer {
             area_lights: area_lights_arr,
             inverse_projection: inv_proj.to_cols_array_2d(),
             ssao_params: [0.5, 0.025, 1.5, 1.0], // radius, bias, power, enable
+            screen_size: [self.swapchain_extent.width as f32, self.swapchain_extent.height as f32, 0.0, 0.0],
         };
         self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))?;
 
