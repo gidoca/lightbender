@@ -136,7 +136,7 @@ float sampleShadowPCSS(int vpIdx, vec3 worldPos, float lightSizeUV) {
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z > 1.0)
         return 1.0;
 
-    float bias = 0.005;
+    float bias = 0.0005;
     float receiver = proj.z;
 
     // Per-pixel rotation of the Poisson disk so neighbouring fragments don't

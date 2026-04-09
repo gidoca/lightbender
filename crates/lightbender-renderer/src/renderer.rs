@@ -1371,13 +1371,14 @@ impl Renderer {
             let far = 100.0_f32;
             let light_proj = glam::Mat4::perspective_rh(fov, 1.0, near, far);
 
-            // PCSS kernel scale: half of the longest edge, projected through
-            // the perspective frustum at the near plane. The shadow map's UV
-            // span at the near plane equals 2 * near * tan(fov/2), so the
-            // light's world half-extent maps to half_extent / span in UVs.
+            // PCSS kernel scale: the light's angular half-extent expressed as
+            // a fraction of the shadow frustum's half-angle.  Dividing by
+            // tan(fov/2) (without multiplying by near) gives a value that
+            // represents the light's angular size independent of the near
+            // plane distance — otherwise a tiny near plane inflates the UV
+            // fraction and produces an absurdly wide blocker search.
             let half_extent = edge_u.length().max(edge_v.length()) * 0.5;
-            let frustum_half_at_near = near * (fov * 0.5).tan();
-            let light_size_uv = (half_extent / (2.0 * frustum_half_at_near)).clamp(0.0, 0.25);
+            let light_size_uv = (half_extent / (2.0 * (fov * 0.5).tan())).clamp(0.0, 0.1);
 
             shadow_vp_mats[shadow_count as usize] = light_proj * light_view;
             area.shadow_vp_index = shadow_count as i32;
