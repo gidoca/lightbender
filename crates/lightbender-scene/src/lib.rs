@@ -95,6 +95,9 @@ pub struct FrameUniforms {
     pub area_light_count: u32,
     pub shadow_vp:        [[[f32; 4]; 4]; MAX_SHADOW_CASTERS],
     pub area_lights:      [GpuAreaLight; MAX_AREA_LIGHTS],
+    pub inverse_projection: [[f32; 4]; 4],
+    /// x = radius, y = bias, z = power, w = enable (> 0.5 = on)
+    pub ssao_params:      [f32; 4],
 }
 
 /// Material factors pushed alongside the model matrix (push constants).

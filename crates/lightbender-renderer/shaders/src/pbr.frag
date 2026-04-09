@@ -42,6 +42,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     uint         areaLightCount;
     mat4         shadowVP[4];
     GpuAreaLight areaLights[4];
+    mat4         inverseProjection;
+    vec4         ssaoParams; // x=radius, y=bias, z=power, w=enable
 } frame;
 
 // Material textures (set 1)
@@ -60,6 +62,9 @@ layout(set = 3, binding = 0) uniform sampler2DArray shadowMap;
 // LTC LUTs (set 4) — see crates/lightbender-renderer/src/ltc.rs
 layout(set = 4, binding = 0) uniform sampler2D ltcMat;
 layout(set = 4, binding = 1) uniform sampler2D ltcMag;
+
+// SSAO (set 5) — screen-space ambient occlusion result
+layout(set = 5, binding = 0) uniform sampler2D ssaoTex;
 
 // Material factors (push constants, offset 64)
 layout(push_constant) uniform MaterialFactors {
@@ -401,7 +406,11 @@ void main() {
     // to approximate the blurring effect of rough surfaces
     vec3 specularIBL = specEnv * F_ibl * (1.0 - roughness * roughness);
 
-    vec3 ambient = (diffuseIBL + specularIBL) * occlusion * frame.envIntensity;
+    float ssaoFactor = 1.0;
+    if (frame.ssaoParams.w > 0.5) {
+        ssaoFactor = texture(ssaoTex, gl_FragCoord.xy / vec2(textureSize(ssaoTex, 0))).r;
+    }
+    vec3 ambient = (diffuseIBL + specularIBL) * occlusion * ssaoFactor * frame.envIntensity;
 
     vec3 color = ambient + Lo + emissive * 3.0;
 

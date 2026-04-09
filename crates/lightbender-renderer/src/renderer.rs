@@ -18,6 +18,7 @@ use crate::buffer::{find_memory_type as find_mem_type, upload_to_device_local, G
 use crate::gpu_scene::{GpuScene, GpuTexture};
 use crate::image::{transition_layout_ex, GpuImage};
 use crate::ltc::LtcResources;
+use crate::ssao::{GBufferResources, SsaoResources};
 
 // ── Embedded built-in shaders (compiled at build time) ─────────────────────
 
@@ -48,6 +49,21 @@ fn skybox_frag_spv() -> Vec<u32> {
 }
 fn shadow_vert_spv() -> Vec<u32> {
     bytes_to_spirv(include_bytes!("../shaders/compiled/shadow.vert.spv"))
+}
+pub(crate) fn gbuffer_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/gbuffer.vert.spv"))
+}
+pub(crate) fn gbuffer_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/gbuffer.frag.spv"))
+}
+pub(crate) fn fullscreen_vert_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/fullscreen.vert.spv"))
+}
+pub(crate) fn ssao_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/ssao.frag.spv"))
+}
+pub(crate) fn ssao_blur_frag_spv() -> Vec<u32> {
+    bytes_to_spirv(include_bytes!("../shaders/compiled/ssao_blur.frag.spv"))
 }
 
 type SwapchainInfo = (
@@ -115,6 +131,10 @@ pub struct Renderer {
     env_set_layout: vk::DescriptorSetLayout,
     /// Set 4: LTC lookup tables (2× combined image samplers, static).
     ltc: LtcResources,
+    /// G-buffer pre-pass for SSAO (view-space normals + depth).
+    gbuffer: GBufferResources,
+    /// SSAO compute + blur resources; output bound as set 5.
+    ssao: SsaoResources,
     pipeline_layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
     /// "default" pipeline + any user-loaded named pipelines
@@ -382,11 +402,22 @@ impl Renderer {
             log::debug!("Pipeline cache loaded from {PIPELINE_CACHE_FILE} ({} bytes)", cache_data.len());
         }
 
+        // --- G-buffer & SSAO (before pipeline, need output_set_layout for set 5) ---
+        let gbuffer = GBufferResources::create(
+            &device, &instance, physical_device, swapchain_extent,
+            descriptor_set_layout, pipeline_cache,
+        ).context("gbuffer resources")?;
+        let ssao = SsaoResources::create(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            pipeline_cache, swapchain_extent, &gbuffer,
+        ).context("ssao resources")?;
+
         // --- Pipeline ---
         let (pipeline_layout, default_pipeline) =
             create_pipeline(
                 &device, render_pass, descriptor_set_layout, material_set_layout,
                 env_set_layout, shadow_set_layout, ltc.set_layout,
+                ssao.output_set_layout,
                 pipeline_cache, None, None,
             ).context("pipeline")?;
         let mut pipelines = HashMap::new();
@@ -598,6 +629,8 @@ impl Renderer {
             material_set_layout,
             env_set_layout,
             ltc,
+            gbuffer,
+            ssao,
             pipeline_layout,
             pipeline_cache,
             pipelines,
@@ -843,10 +876,21 @@ impl Renderer {
             None,
         ).context("pipeline cache")?;
 
+        // --- G-buffer & SSAO ---
+        let gbuffer = GBufferResources::create(
+            &device, &instance, physical_device, swapchain_extent,
+            descriptor_set_layout, pipeline_cache,
+        ).context("gbuffer resources")?;
+        let ssao = SsaoResources::create(
+            &device, &instance, physical_device, command_pool, graphics_queue,
+            pipeline_cache, swapchain_extent, &gbuffer,
+        ).context("ssao resources")?;
+
         let (pipeline_layout, default_pipeline) =
             create_pipeline(
                 &device, render_pass, descriptor_set_layout, material_set_layout,
                 env_set_layout, shadow_set_layout, ltc.set_layout,
+                ssao.output_set_layout,
                 pipeline_cache, None, None,
             ).context("pipeline")?;
         let mut pipelines = HashMap::new();
@@ -1027,6 +1071,8 @@ impl Renderer {
             material_set_layout,
             env_set_layout,
             ltc,
+            gbuffer,
+            ssao,
             pipeline_layout,
             pipeline_cache,
             pipelines,
@@ -1344,6 +1390,8 @@ impl Renderer {
             shadow_vp[i] = m.to_cols_array_2d();
         }
 
+        let inv_proj = proj.inverse();
+
         let uniforms = FrameUniforms {
             view: view.to_cols_array_2d(),
             projection: proj.to_cols_array_2d(),
@@ -1355,8 +1403,14 @@ impl Renderer {
             area_light_count: area_count as u32,
             shadow_vp,
             area_lights: area_lights_arr,
+            inverse_projection: inv_proj.to_cols_array_2d(),
+            ssao_params: [0.5, 0.025, 1.5, 1.0], // radius, bias, power, enable
         };
         self.ubo_buffers[frame].upload_slice(&self.device, std::slice::from_ref(&uniforms))?;
+
+        // Update SSAO UBO with current projection matrices
+        self.ssao.update_ubo(&self.device, proj, inv_proj, self.swapchain_extent)?;
+
         Ok((shadow_vp_mats, shadow_count))
     }
 
@@ -1450,6 +1504,133 @@ impl Renderer {
             );
         }
 
+        // ── G-buffer pre-pass (normals + depth for SSAO) ──────────────────
+        if let Some(scene) = &self.gpu_scene {
+            let gb_clear = [
+                vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.5, 0.5, 1.0, 1.0] },
+                },
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                },
+            ];
+            let gb_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.gbuffer.render_pass)
+                .framebuffer(self.gbuffer.framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                })
+                .clear_values(&gb_clear);
+
+            self.device.cmd_begin_render_pass(cmd, &gb_begin, vk::SubpassContents::INLINE);
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.gbuffer.pipeline);
+
+            let viewport = vk::Viewport {
+                x: 0.0, y: 0.0,
+                width: self.swapchain_extent.width as f32,
+                height: self.swapchain_extent.height as f32,
+                min_depth: 0.0, max_depth: 1.0,
+            };
+            self.device.cmd_set_viewport(cmd, 0, &[viewport]);
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.swapchain_extent,
+            };
+            self.device.cmd_set_scissor(cmd, 0, &[scissor]);
+
+            // Bind frame UBO (set 0) for the gbuffer pipeline
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::GRAPHICS, self.gbuffer.pipeline_layout,
+                0, &[self.descriptor_sets[frame]], &[],
+            );
+
+            // Draw all opaque primitives
+            for (world, prim) in scene.draw_primitives() {
+                let mat = &scene.materials[prim.material];
+                if mat.base_color_factor[3] < 1.0 {
+                    continue; // skip transparent
+                }
+                let model_arr = world.to_cols_array_2d();
+                let model_bytes = bytemuck::bytes_of(&model_arr);
+                self.device.cmd_push_constants(
+                    cmd, self.gbuffer.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX, 0, model_bytes,
+                );
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[prim.vertex_buffer.buffer], &[0]);
+                self.device.cmd_bind_index_buffer(cmd, prim.index_buffer.buffer, 0, vk::IndexType::UINT32);
+                self.device.cmd_draw_indexed(cmd, prim.index_count, 1, 0, 0, 0);
+            }
+
+            self.device.cmd_end_render_pass(cmd);
+        }
+
+        // ── SSAO pass ─────────────────────────────────────────────────────
+        {
+            let ao_extent = vk::Extent2D {
+                width: (self.swapchain_extent.width / 2).max(1),
+                height: (self.swapchain_extent.height / 2).max(1),
+            };
+            let ssao_viewport = vk::Viewport {
+                x: 0.0, y: 0.0,
+                width: ao_extent.width as f32,
+                height: ao_extent.height as f32,
+                min_depth: 0.0, max_depth: 1.0,
+            };
+            let ssao_scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: ao_extent,
+            };
+
+            // SSAO main pass
+            let ssao_clear = [vk::ClearValue {
+                color: vk::ClearColorValue { float32: [1.0, 1.0, 1.0, 1.0] },
+            }];
+            let ssao_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.ssao.ssao_render_pass)
+                .framebuffer(self.ssao.ssao_framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: ao_extent,
+                })
+                .clear_values(&ssao_clear);
+
+            self.device.cmd_begin_render_pass(cmd, &ssao_begin, vk::SubpassContents::INLINE);
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ssao.ssao_pipeline);
+            self.device.cmd_set_viewport(cmd, 0, &[ssao_viewport]);
+            self.device.cmd_set_scissor(cmd, 0, &[ssao_scissor]);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::GRAPHICS, self.ssao.ssao_pipeline_layout,
+                0, &[self.ssao.ssao_descriptor_set], &[],
+            );
+            self.device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(cmd);
+
+            // SSAO blur pass
+            let blur_clear = [vk::ClearValue {
+                color: vk::ClearColorValue { float32: [1.0, 1.0, 1.0, 1.0] },
+            }];
+            let blur_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.ssao.blur_render_pass)
+                .framebuffer(self.ssao.blur_framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: ao_extent,
+                })
+                .clear_values(&blur_clear);
+
+            self.device.cmd_begin_render_pass(cmd, &blur_begin, vk::SubpassContents::INLINE);
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ssao.blur_pipeline);
+            self.device.cmd_set_viewport(cmd, 0, &[ssao_viewport]);
+            self.device.cmd_set_scissor(cmd, 0, &[ssao_scissor]);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::GRAPHICS, self.ssao.blur_pipeline_layout,
+                0, &[self.ssao.blur_descriptor_set], &[],
+            );
+            self.device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(cmd);
+        }
+
         // ── Main render pass ───────────────────────────────────────────────
         let clear_values = [
             vk::ClearValue {
@@ -1514,6 +1695,12 @@ impl Renderer {
         self.device.cmd_bind_descriptor_sets(
             cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
             3, &[self.shadow_descriptor_sets[frame]], &[],
+        );
+
+        // Bind SSAO output descriptor set (set 5)
+        self.device.cmd_bind_descriptor_sets(
+            cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
+            5, &[self.ssao.output_descriptor_set], &[],
         );
 
         // Draw skybox if environment map is loaded
@@ -1648,6 +1835,7 @@ impl Renderer {
                 &self.device, self.render_pass,
                 self.descriptor_set_layout, self.material_set_layout, self.env_set_layout,
                 self.shadow_set_layout, self.ltc.set_layout,
+                self.ssao.output_set_layout,
                 self.pipeline_cache, Some(&pair), Some(self.pipeline_layout),
             )?;
 
@@ -1920,6 +2108,14 @@ impl Renderer {
             self.depth_image_view, self.swapchain_extent,
         )?;
 
+        // Resize SSAO resources
+        self.gbuffer.resize(
+            &self.device, &self.instance, self.physical_device, extent,
+        )?;
+        self.ssao.resize(
+            &self.device, &self.instance, self.physical_device, extent, &self.gbuffer,
+        )?;
+
         Ok(())
     }
 }
@@ -1978,6 +2174,10 @@ impl Drop for Renderer {
             self.device.destroy_descriptor_set_layout(self.env_set_layout, None);
 
             self.ltc.destroy(&self.device);
+
+            // SSAO cleanup
+            self.ssao.destroy(&self.device);
+            self.gbuffer.destroy(&self.device);
 
             // Shadow mapping cleanup
             for fb in &self.shadow_map_framebuffers {
@@ -2513,6 +2713,7 @@ unsafe fn create_pipeline(
     env_set_layout: vk::DescriptorSetLayout,
     shadow_set_layout: vk::DescriptorSetLayout,
     ltc_set_layout: vk::DescriptorSetLayout,
+    ssao_set_layout: vk::DescriptorSetLayout,
     pipeline_cache: vk::PipelineCache,
     shader_pair: Option<&ShaderPair>,
     existing_layout: Option<vk::PipelineLayout>,
@@ -2589,6 +2790,7 @@ unsafe fn create_pipeline(
             env_set_layout,
             shadow_set_layout,
             ltc_set_layout,
+            ssao_set_layout,
         ];
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
