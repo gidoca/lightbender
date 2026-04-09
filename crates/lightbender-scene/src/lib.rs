@@ -98,6 +98,8 @@ pub struct FrameUniforms {
     pub inverse_projection: [[f32; 4]; 4],
     /// x = radius, y = bias, z = power, w = enable (> 0.5 = on)
     pub ssao_params:      [f32; 4],
+    /// xy = screen width/height in pixels
+    pub screen_size:      [f32; 4],
 }
 
 /// Material factors pushed alongside the model matrix (push constants).

@@ -44,6 +44,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     GpuAreaLight areaLights[4];
     mat4         inverseProjection;
     vec4         ssaoParams; // x=radius, y=bias, z=power, w=enable
+    vec4         screenSize; // xy = screen width/height in pixels
 } frame;
 
 // Material textures (set 1)
@@ -408,7 +409,7 @@ void main() {
 
     float ssaoFactor = 1.0;
     if (frame.ssaoParams.w > 0.5) {
-        ssaoFactor = texture(ssaoTex, gl_FragCoord.xy / vec2(textureSize(ssaoTex, 0))).r;
+        ssaoFactor = texture(ssaoTex, gl_FragCoord.xy / frame.screenSize.xy).r;
     }
     vec3 ambient = (diffuseIBL + specularIBL) * occlusion * ssaoFactor * frame.envIntensity;
 
