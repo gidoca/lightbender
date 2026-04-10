@@ -1,0 +1,50 @@
+{
+  "camera": {
+    "target":   [0.0, 0.0, 0.0],
+    "distance": 2.5,
+    "yaw":      30.0,
+    "pitch":    15.0,
+    "fov_y":    45.0,
+    "near":     0.01,
+    "far":      100.0
+  },
+  "lights": [
+    {
+      "type":      "directional",
+      "name":      "key",
+      "direction": [-0.5, -1.0, -0.5],
+      "color":     [1.0, 0.95, 0.85],
+      "intensity": 3.0
+    },
+    {
+      "type":      "directional",
+      "name":      "fill",
+      "direction": [0.5, -0.3, 0.5],
+      "color":     [0.4, 0.5, 0.7],
+      "intensity": 1.0
+    }
+  ],
+  "shaders": {
+    "pbr": {
+      "vert": "../crates/lightbender-renderer/shaders/compiled/pbr.vert.spv",
+      "frag": "../crates/lightbender-renderer/shaders/compiled/pbr.frag.spv"
+    }
+  },
+  "models": [
+    {
+      "name":    "helmet",
+      "path":    "./assets/DamagedHelmet.glb",
+      "shader":  "pbr",
+      "transform": {
+        "translation": [0.0, 0.0, 0.0],
+        "rotation":    [0.0, 0.0, 0.0, 1.0],
+        "scale":       [1.0, 1.0, 1.0]
+      }
+    }
+  ],
+  "environment": {
+    "ambient_color":     [0.05, 0.07, 0.1],
+    "ambient_intensity": 0.3,
+    "background_color":  [0.08, 0.08, 0.1]
+  }
+}

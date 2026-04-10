@@ -72,10 +72,14 @@ pub fn load_mitsuba(path: &Path) -> Result<LoadedMitsubaScene> {
                     "bsdf" => {
                         let bsdf_type = attr_str(e, "type").unwrap_or_default();
                         let bsdf_id = attr_str(e, "id");
-                        match parse_bsdf(&mut reader, &bsdf_type) {
-                            Ok(mat) => {
+                        match parse_bsdf_full(&mut reader, &bsdf_type) {
+                            Ok(parsed) => {
+                                // Register named inner BSDFs (e.g. from bumpmap wrappers)
+                                for (id, inner_mat) in parsed.named_inner {
+                                    named_bsdfs.insert(id, inner_mat);
+                                }
                                 if let Some(id) = bsdf_id {
-                                    named_bsdfs.insert(id, mat);
+                                    named_bsdfs.insert(id, parsed.material);
                                 }
                             }
                             Err(err) => log::error!("Failed to parse BSDF: {err:#}"),
@@ -149,6 +153,25 @@ pub fn load_mitsuba(path: &Path) -> Result<LoadedMitsubaScene> {
             None
         };
 
+        // Load bump map and convert to normal map if referenced
+        let nm_tex_idx = if let Some(ref tex_path) = mat_desc.bump_texture {
+            let resolved = resolve_path(base_dir, tex_path);
+            match lightbender_object_loaders::load_image_rgba8(&resolved) {
+                Ok(height_tex) => {
+                    let normal_tex = height_map_to_normal_map(&height_tex, 1.0);
+                    let idx = textures.len();
+                    textures.push(normal_tex);
+                    Some(idx)
+                }
+                Err(e) => {
+                    log::error!("Failed to load bump texture {}: {e:#}", resolved.display());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Handle area emitters -> emissive factor
         let mut emissive = mat_desc.emissive;
         if let Some(MitsubaEmitter::Area { radiance }) = &shape.area_emitter {
@@ -162,7 +185,7 @@ pub fn load_mitsuba(path: &Path) -> Result<LoadedMitsubaScene> {
             roughness_factor:  mat_desc.roughness,
             emissive_factor:   [emissive.x, emissive.y, emissive.z],
             base_color_texture: bc_tex_idx,
-            normal_texture:             None,
+            normal_texture:             nm_tex_idx,
             metallic_roughness_texture: None,
             occlusion_texture:          None,
             emissive_texture:           None,
@@ -307,6 +330,49 @@ fn generate_checkerboard_texture(spec: &str) -> TextureData {
         format: TextureFormat::Rgba8,
         pixels,
         sampler: SamplerDesc::default(),
+    }
+}
+
+/// Convert a grayscale height map to a tangent-space normal map using central differences.
+fn height_map_to_normal_map(tex: &TextureData, strength: f32) -> TextureData {
+    let w = tex.width as usize;
+    let h = tex.height as usize;
+    let mut pixels = vec![0u8; w * h * 4];
+
+    let height_at = |x: usize, y: usize| -> f32 {
+        let idx = (y * w + x) * 4;
+        tex.pixels[idx] as f32 / 255.0
+    };
+
+    for y in 0..h {
+        for x in 0..w {
+            let xm = if x == 0 { w - 1 } else { x - 1 };
+            let xp = if x + 1 >= w { 0 } else { x + 1 };
+            let ym = if y == 0 { h - 1 } else { y - 1 };
+            let yp = if y + 1 >= h { 0 } else { y + 1 };
+
+            let dh_dx = (height_at(xp, y) - height_at(xm, y)) * 0.5;
+            let dh_dy = (height_at(x, yp) - height_at(x, ym)) * 0.5;
+
+            let nx = -dh_dx * strength;
+            let ny = -dh_dy * strength;
+            let nz = 1.0_f32;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+
+            let idx = (y * w + x) * 4;
+            pixels[idx]     = ((nx / len * 0.5 + 0.5) * 255.0) as u8;
+            pixels[idx + 1] = ((ny / len * 0.5 + 0.5) * 255.0) as u8;
+            pixels[idx + 2] = ((nz / len * 0.5 + 0.5) * 255.0) as u8;
+            pixels[idx + 3] = 255;
+        }
+    }
+
+    TextureData {
+        width:   tex.width,
+        height:  tex.height,
+        format:  TextureFormat::Rgba8,
+        pixels,
+        sampler: tex.sampler.clone(),
     }
 }
 
@@ -859,6 +925,7 @@ struct MitsubaMaterial {
     eta:                  Option<Vec3>,
     k:                    Option<Vec3>,
     blend_weight:         Option<f32>,
+    bump_texture:         Option<String>,
 }
 
 impl Default for MitsubaMaterial {
@@ -878,14 +945,24 @@ impl Default for MitsubaMaterial {
             eta:                  None,
             k:                    None,
             blend_weight:         None,
+            bump_texture:         None,
         }
     }
 }
 
+struct ParsedBsdf {
+    material: MitsubaMaterial,
+    named_inner: Vec<(String, MitsubaMaterial)>,
+}
+
 fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMaterial> {
+    Ok(parse_bsdf_full(reader, bsdf_type)?.material)
+}
+
+fn parse_bsdf_full(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<ParsedBsdf> {
     let mut mat = MitsubaMaterial::default();
     let mut buf = Vec::new();
-    let mut inner_bsdfs: Vec<MitsubaMaterial> = Vec::new();
+    let mut inner_bsdfs: Vec<(Option<String>, MitsubaMaterial)> = Vec::new();
     let mut skip_buf = Vec::new();
 
     loop {
@@ -899,7 +976,8 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
                 match tag.as_str() {
                     "bsdf" => {
                         let inner_type = attr_str(e, "type").unwrap_or_default();
-                        inner_bsdfs.push(parse_bsdf(reader, &inner_type)?);
+                        let inner_id = attr_str(e, "id");
+                        inner_bsdfs.push((inner_id, parse_bsdf(reader, &inner_type)?));
                     }
                     "texture" => {
                         let tex_type = attr_str(e, "type").unwrap_or_default();
@@ -907,13 +985,16 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
                         let is_color_slot = tex_name == "reflectance"
                             || tex_name == "diffuse_reflectance"
                             || tex_name == "base_color";
+                        let is_bump_slot = tex_name == "map";
                         match tex_type.as_str() {
                             "bitmap" => {
                                 let tex_props = parse_properties(reader, b"texture")?;
-                                if let Some(filename) = tex_props.get_string("filename")
-                                    && is_color_slot
-                                {
-                                    mat.base_color_texture = Some(filename);
+                                if let Some(filename) = tex_props.get_string("filename") {
+                                    if is_color_slot {
+                                        mat.base_color_texture = Some(filename);
+                                    } else if is_bump_slot {
+                                        mat.bump_texture = Some(filename);
+                                    }
                                 }
                             }
                             "checkerboard" => {
@@ -954,22 +1035,45 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
 
     apply_bsdf_type_mapping(&mut mat, bsdf_type);
 
+    // Collect named inner BSDFs to register at the top level
+    let mut named_inner: Vec<(String, MitsubaMaterial)> = Vec::new();
+
     match bsdf_type {
         "twosided" => {
-            if let Some(inner) = inner_bsdfs.into_iter().next() {
+            if let Some((_, inner)) = inner_bsdfs.into_iter().next() {
                 mat.base_color = inner.base_color;
                 mat.alpha = inner.alpha;
                 mat.metallic = inner.metallic;
                 mat.roughness = inner.roughness;
                 mat.emissive = inner.emissive;
                 mat.base_color_texture = inner.base_color_texture;
+                mat.bump_texture = mat.bump_texture.take().or(inner.bump_texture);
             }
             mat.double_sided = true;
+        }
+        "bumpmap" => {
+            let bump = mat.bump_texture.take();
+            if let Some((inner_id, inner)) = inner_bsdfs.into_iter().next() {
+                mat.base_color = inner.base_color;
+                mat.alpha = inner.alpha;
+                mat.metallic = inner.metallic;
+                mat.roughness = inner.roughness;
+                mat.emissive = inner.emissive;
+                mat.double_sided = inner.double_sided;
+                mat.base_color_texture = inner.base_color_texture;
+                mat.bump_texture = bump.clone().or(inner.bump_texture);
+                // If the inner BSDF was named, register it with the bump texture applied
+                if let Some(id) = inner_id {
+                    let mut named_mat = mat.clone();
+                    named_mat.bump_texture = bump.or(named_mat.bump_texture);
+                    named_inner.push((id, named_mat));
+                }
+            }
         }
         "blendbsdf" => {
             let w = mat.blend_weight.unwrap_or(0.5);
             let mut iter = inner_bsdfs.into_iter();
-            if let (Some(a), Some(b)) = (iter.next(), iter.next()) {
+            if let (Some((_, a)), Some((_, b))) = (iter.next(), iter.next()) {
                 mat.base_color = a.base_color * (1.0 - w) + b.base_color * w;
                 mat.alpha = a.alpha * (1.0 - w) + b.alpha * w;
                 mat.metallic = a.metallic * (1.0 - w) + b.metallic * w;
@@ -977,16 +1081,18 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
                 mat.emissive = a.emissive * (1.0 - w) + b.emissive * w;
                 mat.double_sided = a.double_sided || b.double_sided;
                 mat.base_color_texture = a.base_color_texture.or(b.base_color_texture);
+                mat.bump_texture = a.bump_texture.or(b.bump_texture);
             }
         }
         "mask" => {
-            if let Some(inner) = inner_bsdfs.into_iter().next() {
+            if let Some((_, inner)) = inner_bsdfs.into_iter().next() {
                 mat.base_color = inner.base_color;
                 mat.metallic = inner.metallic;
                 mat.roughness = inner.roughness;
                 mat.emissive = inner.emissive;
                 mat.base_color_texture = inner.base_color_texture;
                 mat.double_sided = inner.double_sided;
+                mat.bump_texture = inner.bump_texture;
             }
         }
         "null" => {
@@ -995,7 +1101,7 @@ fn parse_bsdf(reader: &mut Reader<&[u8]>, bsdf_type: &str) -> Result<MitsubaMate
         _ => {}
     }
 
-    Ok(mat)
+    Ok(ParsedBsdf { material: mat, named_inner })
 }
 
 fn handle_bsdf_property(e: &quick_xml::events::BytesStart, tag: &str, mat: &mut MitsubaMaterial) {
@@ -1080,7 +1186,7 @@ fn apply_bsdf_type_mapping(mat: &mut MitsubaMaterial, bsdf_type: &str) {
             mat.alpha = f0.max(0.05);
             mat.double_sided = true;
         }
-        "twosided" => {}
+        "twosided" | "bumpmap" => {}
         _ => {
             if bsdf_type != "null" && bsdf_type != "mask" && bsdf_type != "blendbsdf" {
                 log::warn!("Unsupported BSDF type '{bsdf_type}', using default gray diffuse");
@@ -1609,6 +1715,88 @@ mod tests {
             </texture>
         "#, "diffuse").unwrap();
         assert_eq!(m.base_color_texture.as_deref(), Some("textures/wood.jpg"));
+    }
+
+    #[test]
+    fn test_bumpmap_bsdf() {
+        let m = parse_bsdf_str(r#"
+            <texture type="bitmap" name="map">
+                <string name="filename" value="textures/floor_tiles.png"/>
+            </texture>
+            <bsdf type="diffuse">
+                <rgb name="reflectance" value="0.6, 0.6, 0.6"/>
+            </bsdf>
+        "#, "bumpmap").unwrap();
+        assert_eq!(m.bump_texture.as_deref(), Some("textures/floor_tiles.png"));
+        assert!((m.base_color.x - 0.6).abs() < 1e-6);
+        assert!(m.bump_texture.is_some());
+    }
+
+    #[test]
+    fn test_twosided_bumpmap_bsdf() {
+        let m = parse_bsdf_str(r#"
+            <bsdf type="bumpmap">
+                <texture type="bitmap" name="map">
+                    <string name="filename" value="textures/bump.png"/>
+                </texture>
+                <bsdf type="diffuse">
+                    <rgb name="reflectance" value="0.5, 0.5, 0.5"/>
+                </bsdf>
+            </bsdf>
+        "#, "twosided").unwrap();
+        assert!(m.double_sided);
+        assert_eq!(m.bump_texture.as_deref(), Some("textures/bump.png"));
+        assert!((m.base_color.x - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_height_map_to_normal_map_flat() {
+        let tex = TextureData {
+            width: 4,
+            height: 4,
+            format: TextureFormat::Rgba8,
+            pixels: vec![128; 4 * 4 * 4], // uniform gray
+            sampler: SamplerDesc::default(),
+        };
+        let normal = height_map_to_normal_map(&tex, 1.0);
+        assert_eq!(normal.width, 4);
+        assert_eq!(normal.height, 4);
+        // Flat surface: normal should be approximately (0,0,1) → encoded as (128,128,255)
+        for y in 0..4 {
+            for x in 0..4 {
+                let idx = (y * 4 + x) * 4;
+                assert!((normal.pixels[idx] as i32 - 128).unsigned_abs() <= 1, "R at ({x},{y})");
+                assert!((normal.pixels[idx + 1] as i32 - 128).unsigned_abs() <= 1, "G at ({x},{y})");
+                assert!((normal.pixels[idx + 2] as i32 - 255).unsigned_abs() <= 1, "B at ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_height_map_to_normal_map_gradient() {
+        // Height increases from left to right
+        let mut pixels = vec![0u8; 4 * 4 * 4];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let val = (x as u8) * 85; // 0, 85, 170, 255
+                let idx = (y * 4 + x) * 4;
+                pixels[idx] = val;
+                pixels[idx + 1] = val;
+                pixels[idx + 2] = val;
+                pixels[idx + 3] = 255;
+            }
+        }
+        let tex = TextureData {
+            width: 4,
+            height: 4,
+            format: TextureFormat::Rgba8,
+            pixels,
+            sampler: SamplerDesc::default(),
+        };
+        let normal = height_map_to_normal_map(&tex, 1.0);
+        // Interior pixel (1,1): dh/dx > 0, so nx < 0, encoded R < 128
+        let idx = (1 * 4 + 1) * 4;
+        assert!(normal.pixels[idx] < 128, "R should be < 128 for positive slope, got {}", normal.pixels[idx]);
     }
 
     fn parse_emitter_str(xml: &str, emitter_type: &str) -> Result<MitsubaEmitter> {
