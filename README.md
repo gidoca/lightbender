@@ -4,7 +4,7 @@ A Vulkan-based 3D renderer written in Rust. Supports PBR materials, glTF models,
 
 ## Dependencies
 
-- **Rust** (2021 edition) -- install via [rustup](https://rustup.rs/)
+- **Rust** (2024 edition) -- install via [rustup](https://rustup.rs/)
 - **Vulkan driver** -- a GPU with Vulkan 1.0 support and an installed driver
 - **glslc** (GLSL to SPIR-V compiler) -- part of the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) or available standalone via the `shaderc` package. Needed to compile shaders at build time.
 - **Vulkan SDK** (optional, recommended) -- provides the `VK_LAYER_KHRONOS_validation` layer used for debugging and integration tests. Download from https://vulkan.lunarg.com/sdk/home and source `setup-env.sh` to make it available:
