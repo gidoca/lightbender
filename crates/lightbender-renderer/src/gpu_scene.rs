@@ -122,7 +122,7 @@ impl GpuScene {
         // Base color and emissive are sRGB; normal, metallic-roughness, occlusion are linear
         let white_tex       = make_srgb_placeholder([255, 255, 255, 255])?;
         let flat_normal_tex = make_linear_placeholder([128, 128, 255, 255])?;
-        let mr_placeholder  = make_linear_placeholder([0, 128, 0, 255])?;
+        let mr_placeholder  = make_linear_placeholder([255, 255, 255, 255])?;
         let black_tex       = make_srgb_placeholder([0, 0, 0, 255])?;
 
         // ── Descriptor pool for materials ───────────────────────────────────
