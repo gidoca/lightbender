@@ -29,10 +29,11 @@ pub struct App {
 }
 
 struct AppState {
-    window:   Arc<Window>,
-    renderer: Renderer,
-    camera:   OrbitalCamera,
-    input:    InputState,
+    window:    Arc<Window>,
+    renderer:  Renderer,
+    camera:    OrbitalCamera,
+    input:     InputState,
+    modifiers: winit::keyboard::ModifiersState,
 }
 
 impl App {
@@ -52,7 +53,8 @@ impl App {
         let camera = load_scene_into_renderer(&mut renderer, self.input_path.as_ref())?;
 
         let input = InputState::default();
-        self.state = Some(AppState { window, renderer, camera, input });
+        let modifiers = winit::keyboard::ModifiersState::default();
+        self.state = Some(AppState { window, renderer, camera, input, modifiers });
         Ok(())
     }
 }
@@ -271,12 +273,23 @@ impl ApplicationHandler for App {
                 let pressed = event.state == ElementState::Pressed;
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
+                    PhysicalKey::Code(KeyCode::Enter) if pressed && state.modifiers.alt_key() => {
+                        let fullscreen = if state.window.fullscreen().is_some() {
+                            None
+                        } else {
+                            Some(winit::window::Fullscreen::Borderless(None))
+                        };
+                        state.window.set_fullscreen(fullscreen);
+                    }
                     PhysicalKey::Code(KeyCode::KeyW) => state.input.key_w = pressed,
                     PhysicalKey::Code(KeyCode::KeyA) => state.input.key_a = pressed,
                     PhysicalKey::Code(KeyCode::KeyS) => state.input.key_s = pressed,
                     PhysicalKey::Code(KeyCode::KeyD) => state.input.key_d = pressed,
                     _ => {}
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                state.modifiers = modifiers.state();
             }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
