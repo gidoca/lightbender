@@ -121,6 +121,7 @@ pub(crate) struct GBufferResources {
     pub render_pass: vk::RenderPass,
     pub pipeline_layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
+    pub pipeline_double_sided: vk::Pipeline,
     pub framebuffer: vk::Framebuffer,
     pub normal_image: ImageAlloc,
     pub depth_image: ImageAlloc,
@@ -209,7 +210,8 @@ impl GBufferResources {
             )
             .context("gbuffer pipeline layout")?;
 
-        let pipeline = create_gbuffer_pipeline(device, render_pass, pipeline_layout, pipeline_cache)?;
+        let pipeline = create_gbuffer_pipeline(device, render_pass, pipeline_layout, pipeline_cache, vk::CullModeFlags::BACK)?;
+        let pipeline_double_sided = create_gbuffer_pipeline(device, render_pass, pipeline_layout, pipeline_cache, vk::CullModeFlags::NONE)?;
 
         let normal_image = create_attachment(
             device, instance, physical_device,
@@ -243,6 +245,7 @@ impl GBufferResources {
             render_pass,
             pipeline_layout,
             pipeline,
+            pipeline_double_sided,
             framebuffer,
             normal_image,
             depth_image,
@@ -297,6 +300,7 @@ impl GBufferResources {
         destroy_attachment(device, &self.normal_image);
         destroy_attachment(device, &self.depth_image);
         device.destroy_pipeline(self.pipeline, None);
+        device.destroy_pipeline(self.pipeline_double_sided, None);
         device.destroy_pipeline_layout(self.pipeline_layout, None);
         device.destroy_render_pass(self.render_pass, None);
     }
@@ -307,6 +311,7 @@ unsafe fn create_gbuffer_pipeline(
     render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
     pipeline_cache: vk::PipelineCache,
+    cull_mode: vk::CullModeFlags,
 ) -> Result<vk::Pipeline> {
     let vert_spv = crate::renderer::gbuffer_vert_spv();
     let frag_spv = crate::renderer::gbuffer_frag_spv();
@@ -350,7 +355,7 @@ unsafe fn create_gbuffer_pipeline(
         .scissor_count(1);
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::BACK)
+        .cull_mode(cull_mode)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()

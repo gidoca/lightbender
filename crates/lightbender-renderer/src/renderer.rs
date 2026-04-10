@@ -1526,7 +1526,9 @@ impl Renderer {
                 .clear_values(&gb_clear);
 
             self.device.cmd_begin_render_pass(cmd, &gb_begin, vk::SubpassContents::INLINE);
-            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.gbuffer.pipeline);
+
+            let mut bound_gb_pipeline = self.gbuffer.pipeline;
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, bound_gb_pipeline);
 
             let viewport = vk::Viewport {
                 x: 0.0, y: 0.0,
@@ -1552,6 +1554,15 @@ impl Renderer {
                 let mat = &scene.materials[prim.material];
                 if mat.base_color_factor[3] < 1.0 {
                     continue; // skip transparent
+                }
+                let gb_pipeline = if mat.double_sided {
+                    self.gbuffer.pipeline_double_sided
+                } else {
+                    self.gbuffer.pipeline
+                };
+                if gb_pipeline != bound_gb_pipeline {
+                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, gb_pipeline);
+                    bound_gb_pipeline = gb_pipeline;
                 }
                 let model_arr = world.to_cols_array_2d();
                 let model_bytes = bytemuck::bytes_of(&model_arr);
